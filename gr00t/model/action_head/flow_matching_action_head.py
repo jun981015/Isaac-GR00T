@@ -339,8 +339,17 @@ class FlowmatchingActionHead(nn.Module):
 
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
-        loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-        loss = loss.sum() / action_mask.sum()
+        elementwise_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
+        if "loss_weight" in action_input:
+            per_sample_loss = elementwise_loss.sum(dim=(1, 2)) / action_mask.sum(
+                dim=(1, 2)
+            ).clamp_min(1)
+            loss_weight = action_input.loss_weight.reshape(-1).to(
+                device=per_sample_loss.device, dtype=per_sample_loss.dtype
+            )
+            loss = (per_sample_loss * loss_weight).mean()
+        else:
+            loss = elementwise_loss.sum() / action_mask.sum()
         output_dict = {
             "loss": loss,
         }

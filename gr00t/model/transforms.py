@@ -321,6 +321,8 @@ class GR00TTransform(InvertibleModalityTransform):
             actions, actions_mask, _ = self._prepare_action(data)
             transformed_data["action"] = actions
             transformed_data["action_mask"] = actions_mask
+            if "loss_weight" in data:
+                transformed_data["loss_weight"] = np.asarray(data["loss_weight"], dtype=np.float32)
 
         for k, v in vlm_outputs.items():
             assert k not in transformed_data, f"Key {k} already exists in transformed_data."
