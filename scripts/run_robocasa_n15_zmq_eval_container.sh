@@ -5,27 +5,29 @@ REPO_DIR="${REPO_DIR:-/home/junhyeong/Value/Isaac-GR00T}"
 ROBOCASA_DIR="${ROBOCASA_DIR:-/home/junhyeong/workspace/robocasa}"
 ROBOSUITE_DIR="${ROBOSUITE_DIR:-/home/junhyeong/workspace/robosuite}"
 IMAGE_NAME="${IMAGE_NAME:-isaac-gr00t-robocasa:benchmark}"
-CONTAINER_NAME="${CONTAINER_NAME:-isaac-gr00t-robocasa-bench-n15}"
-GPU_DEVICE="${GPU_DEVICE:-0}"
+CONTAINER_NAME="${CONTAINER_NAME:-isaac-gr00t-robocasa-bench-zmq-n15}"
+GPU_DEVICE="${GPU_DEVICE:-3}"
 MODEL_HOST="${MODEL_HOST:-127.0.0.1}"
 PORT="${PORT:-8011}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_DIR}/local_outputs/robocasa_benchmark/${CONTAINER_NAME}}"
-SCHEDULE_DIR="${SCHEDULE_DIR:-${REPO_DIR}/local_outputs/robocasa_benchmark/schedules}"
+SCHEDULE_DIR="${SCHEDULE_DIR:-/home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_benchmark/schedules}"
 RUNTIME_STATE_HOST_DIR="${RUNTIME_STATE_HOST_DIR:-${REPO_DIR}/local_outputs/robocasa_benchmark_runtime}"
 ENV_NAME="${ENV_NAME:-PnPCounterToSink}"
 SEED="${SEED:-1}"
-ACTION_SEED_BASE="${ACTION_SEED_BASE:-}"
 N_EPISODES="${N_EPISODES:-50}"
 N_ACTION_STEPS="${N_ACTION_STEPS:-16}"
 MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-800}"
 VIDEO_FPS="${VIDEO_FPS:-20}"
 VIDEO_SCALE="${VIDEO_SCALE:-2}"
-VIDEO_RENDER_SIZE="${VIDEO_RENDER_SIZE:-512}"
+VIDEO_RENDER_SIZE="${VIDEO_RENDER_SIZE:-256}"
 VIDEO_SOURCE="${VIDEO_SOURCE:-obs}"
 VIDEO_STEPS_PER_RENDER="${VIDEO_STEPS_PER_RENDER:-4}"
+CAMERA_WIDTH="${CAMERA_WIDTH:-256}"
+CAMERA_HEIGHT="${CAMERA_HEIGHT:-256}"
+POLICY_IMAGE_SIZE="${POLICY_IMAGE_SIZE:-128}"
+WRITE_VIDEO="${WRITE_VIDEO:-1}"
 STREAM_VIDEO="${STREAM_VIDEO:-1}"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"
-DETERMINISTIC_ACTION_SEED="${DETERMINISTIC_ACTION_SEED:-1}"
 OBJ_INSTANCE_SPLIT="${OBJ_INSTANCE_SPLIT:-A}"
 LAYOUT_STYLE_IDS="${LAYOUT_STYLE_IDS:-1:1,2:2,4:4,6:9,7:10}"
 SCHEDULE_PATH="${SCHEDULE_PATH:-${SCHEDULE_DIR}/seed${SEED}/${ENV_NAME}_${N_EPISODES}eps.json}"
@@ -65,14 +67,11 @@ fi
 if [[ "${STREAM_VIDEO}" == "1" ]]; then
   EXTRA_ARGS+=(--stream_video)
 fi
+if [[ "${WRITE_VIDEO}" == "0" ]]; then
+  EXTRA_ARGS+=(--no_video)
+fi
 if [[ "${SKIP_EXISTING}" == "1" ]]; then
   EXTRA_ARGS+=(--skip_existing)
-fi
-if [[ -n "${ACTION_SEED_BASE}" ]]; then
-  EXTRA_ARGS+=(--action_seed_base "${ACTION_SEED_BASE}")
-fi
-if [[ "${DETERMINISTIC_ACTION_SEED}" == "0" ]]; then
-  EXTRA_ARGS+=(--no_deterministic_action_seed)
 fi
 
 docker run -d \
@@ -99,12 +98,12 @@ docker run -d \
     if [[ '${BOOTSTRAP_DEPS}' == '1' ]]; then
       python -m pip install --user --no-cache-dir -q \
         numpy==1.23.5 mujoco==3.2.6 numba==0.57.1 \
-        requests json-numpy imageio imageio-ffmpeg termcolor \
+        pyzmq msgpack pandas imageio imageio-ffmpeg termcolor \
         opencv-python opencv-python-headless \
         scipy h5py lxml pygame pynput hidapi \
         'qpsolvers[quadprog]' mink tianshou
     fi
-    python scripts/robocasa_n15_http_eval.py \
+    python scripts/robocasa_n15_zmq_eval.py \
       --env_name '${ENV_NAME}' \
       --host '${MODEL_HOST}' \
       --port '${PORT}' \
@@ -119,6 +118,9 @@ docker run -d \
       --video_render_size '${VIDEO_RENDER_SIZE}' \
       --video_source '${VIDEO_SOURCE}' \
       --video_steps_per_render '${VIDEO_STEPS_PER_RENDER}' \
+      --camera_width '${CAMERA_WIDTH}' \
+      --camera_height '${CAMERA_HEIGHT}' \
+      --policy_image_size '${POLICY_IMAGE_SIZE}' \
       --obj_instance_split '${OBJ_INSTANCE_SPLIT}' \
       --layout_style_ids '${LAYOUT_STYLE_IDS}' \
       ${EXTRA_ARGS[*]} \

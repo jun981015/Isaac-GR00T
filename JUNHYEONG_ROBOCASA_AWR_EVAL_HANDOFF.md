@@ -148,6 +148,25 @@ Long-running / temporary:
 /home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_awr_retrain/temporary_pm16_alpha50_100k_gpu2_save200k
 ```
 
+## Training Logging Rule
+
+Use WandB for all future training launches unless the user explicitly says otherwise.
+
+```bash
+export WANDB_ENTITY=RwHlabs
+export WANDB_PROJECT=groot_robocasa_finetune_3_task
+export WANDB_DIR=/workspace/outputs/home/wandb
+export WANDB_CACHE_DIR=/workspace/outputs/home/.cache/wandb
+```
+
+Training commands should pass:
+
+```bash
+--report-to wandb
+```
+
+Do not copy the previous `--report-to tensorboard` setting into new runs. The current 8-task AWR run was launched with tensorboard logging, so it will not appear in WandB unless restarted or manually synced later.
+
 ## Eval Tasks And Fixed Settings
 
 Eval tasks:
@@ -420,4 +439,159 @@ mkdir -p new_window_alpha_eval
 rsync -avP \
   junhyeong50:/home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_benchmark/new_window_alpha_eval_seed1_50ep_20260428/ \
   ./new_window_alpha_eval/
+```
+
+## Compact Checkpoint Work
+
+Purpose:
+
+```text
+GR00T checkpoints are large because every checkpoint stores the full base model.
+Most intermediate checkpoints only differ in trainable action-side tensors, while frozen VLM/base tensors are identical to the HF base snapshot.
+The compact checkpoint tools keep changed tensors locally and symlink unchanged tensors to the local HF cache snapshot.
+```
+
+Main repo scripts:
+
+```text
+scripts/compact_groot_checkpoint.py
+scripts/compact_nonfinal_checkpoints.py
+```
+
+Compact eval worktree:
+
+```text
+/home/junhyeong/Value/Isaac-GR00T-compact-eval
+branch: junhyeong-compact-eval
+doc: /home/junhyeong/Value/Isaac-GR00T-compact-eval/COMPACT_CHECKPOINT_EVAL.md
+```
+
+Base model snapshot used by compact checkpoints:
+
+```text
+/home/junhyeong/.cache/huggingface/models--nvidia--GR00T-N1.5-3B/snapshots/869830fc749c35f34771aa5209f923ac57e4564e
+```
+
+Compact checkpoint layout:
+
+```text
+model-changed.safetensors          # changed fine-tuned tensors
+base-model-*.safetensors -> HF cache base shard symlinks
+model.safetensors.index.json       # remaps each tensor to changed shard or base shard symlink
+compact_summary.json               # source/base/output metadata and changed/unchanged size summary
+```
+
+Single-checkpoint compaction command:
+
+```bash
+python scripts/compact_groot_checkpoint.py \
+  --checkpoint /home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_awr_retrain/<run>/checkpoint-<step> \
+  --base /home/junhyeong/.cache/huggingface/models--nvidia--GR00T-N1.5-3B/snapshots/869830fc749c35f34771aa5209f923ac57e4564e \
+  --output /home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_awr_retrain/<run>/checkpoint-<step>-compact
+```
+
+Bulk compaction command:
+
+```bash
+python scripts/compact_nonfinal_checkpoints.py
+```
+
+Bulk compaction behavior:
+
+```text
+root: local_outputs/robocasa_awr_retrain
+For each run directory, the highest checkpoint step is treated as final and is left full-size.
+All lower-step checkpoints are compacted in-place.
+Interrupted temp dirs are handled conservatively:
+  checkpoint-*.compact_tmp is removed as stale temp.
+  checkpoint-*.full_backup_tmp is removed only if the compact replacement is complete.
+Log file:
+  local_outputs/robocasa_awr_retrain/compact_mid_checkpoints_20260430.log
+```
+
+Verified result from this session:
+
+```text
+Compact checkpoint load was tested successfully in Docker with GR00T_N1_5.from_pretrained.
+Example compact test path:
+  local_outputs/robocasa_awr_retrain/awr_alpha10_20k_compact_test/checkpoint-20000
+Approx size change:
+  one checkpoint: about 13G -> about 2.9G
+  local_outputs/robocasa_awr_retrain: about 561G -> about 215G
+```
+
+Important eval requirement:
+
+```text
+Compact checkpoints depend on the HF cache symlink targets.
+Do not delete the HF cache snapshot while compact checkpoints are needed.
+When evaluating compact checkpoints inside Docker, mount the host HF cache at the same absolute path.
+```
+
+Use compact-aware server wrappers from the compact eval worktree:
+
+```bash
+CHECKPOINT_DIR=/home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_awr_retrain/<run>/checkpoint-<step> \
+GPU_DEVICE=<gpu> \
+PORT=<port> \
+CONTAINER_NAME=<name> \
+bash /home/junhyeong/Value/Isaac-GR00T-compact-eval/scripts/run_groot_robocasa_zmq_server.sh
+```
+
+Why use the compact worktree wrapper:
+
+```text
+It mounts HF_CACHE_DIR into Docker so symlinked base shards resolve inside the container.
+It derives REPO_DIR from the script location, so the compact eval worktree code is mounted.
+If compact_summary.json exists, it preflights HF cache existence and base shard symlink targets before starting Docker.
+```
+
+Current main-repo note:
+
+```text
+scripts/run_groot_robocasa_zmq_server.sh in the main repo was also patched to mount HF cache,
+but the compact worktree is the safer documented path for compact checkpoint eval until this is fully committed/cleaned.
+```
+
+### Compact During Finetuning
+
+`scripts/robocasa_awr_finetune.py` now supports compacting model safetensors immediately after each Trainer checkpoint save.
+This only replaces model weight shards; non-model training files are left untouched.
+
+Opt-in flags:
+
+```text
+--compact-checkpoints-on-save
+--compact-base-model-path <path used to read base tensors inside the training runtime>
+--compact-link-base-model-path <path written into checkpoint symlinks, optional>
+--compact-final-model / --no-compact-final-model
+--compact-fail-fast / --no-compact-fail-fast
+```
+
+Recommended container usage:
+
+```text
+--compact-base-model-path /workspace/hf_cache/models--nvidia--GR00T-N1.5-3B/snapshots/869830fc749c35f34771aa5209f923ac57e4564e
+--compact-link-base-model-path /home/junhyeong/.cache/huggingface/models--nvidia--GR00T-N1.5-3B/snapshots/869830fc749c35f34771aa5209f923ac57e4564e
+```
+
+The first path must be readable where training runs.
+The second path is what future eval/load containers must mount so the symlinked base shards resolve.
+
+Files changed by on-save compact:
+
+```text
+model-*.safetensors
+model.safetensors.index.json
+```
+
+Files intentionally not changed:
+
+```text
+optimizer.pt
+scheduler.pt
+rng_state*.pth
+trainer_state.json
+training_args.bin
+experiment_cfg/
 ```

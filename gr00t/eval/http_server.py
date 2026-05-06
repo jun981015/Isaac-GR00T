@@ -12,10 +12,13 @@ Dependencies:
 
 import json
 import logging
+import random
 import traceback
 from typing import Any, Dict, Optional
 
 import json_numpy
+import numpy as np
+import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -60,6 +63,14 @@ class HTTPInferenceServer:
                 )
 
             obs = payload["observation"]
+            action_seed = payload.get("action_seed")
+            if action_seed is not None:
+                seed = int(action_seed)
+                random.seed(seed)
+                np.random.seed(seed)
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)
 
             # Run inference
             action = self.policy.get_action(obs)

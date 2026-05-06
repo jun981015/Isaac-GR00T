@@ -1,0 +1,30 @@
+name: gr00t-train
+channels:
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11.10
+  - pip
+  - setuptools
+  - wheel
+  - cmake
+  - ninja
+  - c-compiler
+  - cxx-compiler
+  # Fallback for flash-attn source builds when a compatible wheel is not found.
+  - cuda-nvcc=12.4
+  - git
+  - git-lfs
+  # torchcodec 0.1.0+cu124 expects FFmpeg ABI 5/6/7; use 6.x.
+  - ffmpeg=6.*
+  # Conda equivalents for Docker apt packages: libglib2.0-0, libsm6,
+  # libxext6, libxrender1. If target host lacks GL libraries, install
+  # OS packages too: libgl1 libglib2.0-0 libsm6 libxext6 libxrender1.
+  - libgl
+  - glib
+  - xorg-libsm
+  - xorg-libxext
+  - xorg-libxrender
+  - tmux
+  - wget
+  - curl

@@ -1,0 +1,19 @@
+name: robocasa-eval
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - setuptools
+  - wheel
+  - git
+  - ffmpeg
+  # Headless / EGL / OpenCV runtime libraries. Some hosts may still need the
+  # equivalent apt packages documented in JUNHYEONG_ROBOCASA_CONDA_EVAL_SETUP.md.
+  - libgl
+  - libegl
+  - glew
+  - glib
+  - xorg-libsm
+  - xorg-libxext
+  - xorg-libxrender
