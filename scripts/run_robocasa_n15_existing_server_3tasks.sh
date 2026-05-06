@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_DIR="${REPO_DIR:-/home/junhyeong/Value/Isaac-GR00T}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_DIR="${REPO_DIR:-${DEFAULT_REPO_DIR}}"
 LABEL="${LABEL:?set LABEL}"
 CKPT_STEP="${CKPT_STEP:?set CKPT_STEP}"
 GPU_DEVICE="${GPU_DEVICE:?set GPU_DEVICE}"

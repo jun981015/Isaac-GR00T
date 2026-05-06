@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_DIR="${REPO_DIR:-/home/junhyeong/Value/Isaac-GR00T}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_DIR="${REPO_DIR:-${DEFAULT_REPO_DIR}}"
 RUN_NAME="${RUN_NAME:-robocasa_n15_eval_$(date +%Y%m%d_%H%M%S)}"
 BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR:-${REPO_DIR}/local_outputs/robocasa_benchmark/${RUN_NAME}}"
 GPU_DEVICE="${GPU_DEVICE:-0}"

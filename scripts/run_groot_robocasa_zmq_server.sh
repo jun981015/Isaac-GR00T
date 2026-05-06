@@ -7,11 +7,11 @@ REPO_DIR="${REPO_DIR:-${DEFAULT_REPO_DIR}}"
 DATA_CONFIG_DIR="${DATA_CONFIG_DIR:-/home/junhyeong/Value/robocasa}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-/home/junhyeong/.cache/huggingface}"
 IMAGE_NAME="${IMAGE_NAME:-isaac-gr00t-robocasa:smoke}"
-CONTAINER_NAME="${CONTAINER_NAME:-isaac-gr00t-robocasa-http-n15}"
-GPU_DEVICE="${GPU_DEVICE:-0}"
+CONTAINER_NAME="${CONTAINER_NAME:-isaac-gr00t-robocasa-zmq-n15}"
+GPU_DEVICE="${GPU_DEVICE:-3}"
 PORT="${PORT:-8011}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:?set CHECKPOINT_DIR to a GR00T checkpoint directory}"
-OUTPUT_DIR="${OUTPUT_DIR:-${REPO_DIR}/local_outputs/robocasa_http_server/${CONTAINER_NAME}}"
+OUTPUT_DIR="${OUTPUT_DIR:-${REPO_DIR}/local_outputs/robocasa_zmq_server/${CONTAINER_NAME}}"
 DENOISING_STEPS="${DENOISING_STEPS:-4}"
 BOOTSTRAP_DEPS="${BOOTSTRAP_DEPS:-0}"
 REPLACE="${REPLACE:-0}"
@@ -60,11 +60,10 @@ docker run -d \
     set -euo pipefail
     export PATH=\"/workspace/output/runtime_home/.local/bin:\$PATH\"
     if [[ '${BOOTSTRAP_DEPS}' == '1' ]]; then
-      python -m pip install --user --no-cache-dir -q fastapi uvicorn json-numpy requests
+      python -m pip install --user --no-cache-dir -q pyzmq msgpack
     fi
     python scripts/inference_service.py \
     --server \
-    --http-server \
     --host 0.0.0.0 \
     --port ${PORT} \
     --model_path /workspace/model_checkpoint \
@@ -74,6 +73,6 @@ docker run -d \
     2>&1 | tee /workspace/output/server.log
   "
 
-echo "Started ${CONTAINER_NAME} on GPU ${GPU_DEVICE}, port ${PORT}"
+echo "Started ZMQ ${CONTAINER_NAME} on GPU ${GPU_DEVICE}, port ${PORT}"
 echo "Checkpoint: ${CHECKPOINT_DIR}"
 echo "Log: ${OUTPUT_DIR}/server.log"
