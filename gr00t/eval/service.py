@@ -22,8 +22,6 @@ import msgpack
 import numpy as np
 import zmq
 
-from gr00t.data.dataset import ModalityConfig
-
 
 class MsgSerializer:
     @staticmethod
@@ -37,6 +35,8 @@ class MsgSerializer:
     @staticmethod
     def decode_custom_classes(obj):
         if "__ModalityConfig_class__" in obj:
+            from gr00t.data.dataset import ModalityConfig
+
             obj = ModalityConfig(**json.loads(obj["as_json"]))
         if "__ndarray_class__" in obj:
             obj = np.load(io.BytesIO(obj["as_npy"]), allow_pickle=False)
@@ -44,12 +44,14 @@ class MsgSerializer:
 
     @staticmethod
     def encode_custom_classes(obj):
-        if isinstance(obj, ModalityConfig):
-            return {"__ModalityConfig_class__": True, "as_json": obj.model_dump_json()}
         if isinstance(obj, np.ndarray):
             output = io.BytesIO()
             np.save(output, obj, allow_pickle=False)
             return {"__ndarray_class__": True, "as_npy": output.getvalue()}
+        from gr00t.data.dataset import ModalityConfig
+
+        if isinstance(obj, ModalityConfig):
+            return {"__ModalityConfig_class__": True, "as_json": obj.model_dump_json()}
         return obj
 
 
@@ -161,6 +163,9 @@ class BaseInferenceClient:
     def _init_socket(self):
         """Initialize or reinitialize the socket with current settings"""
         self.socket = self.context.socket(zmq.REQ)
+        self.socket.setsockopt(zmq.LINGER, 0)
+        self.socket.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
+        self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
         self.socket.connect(f"tcp://{self.host}:{self.port}")
 
     def ping(self) -> bool:
@@ -168,7 +173,6 @@ class BaseInferenceClient:
             self.call_endpoint("ping", requires_input=False)
             return True
         except zmq.error.ZMQError:
-            self._init_socket()  # Recreate socket for next attempt
             return False
 
     def kill_server(self):
@@ -194,8 +198,13 @@ class BaseInferenceClient:
         if self.api_token:
             request["api_token"] = self.api_token
 
-        self.socket.send(MsgSerializer.to_bytes(request))
-        message = self.socket.recv()
+        try:
+            self.socket.send(MsgSerializer.to_bytes(request))
+            message = self.socket.recv()
+        except zmq.error.ZMQError:
+            self.socket.close()
+            self._init_socket()
+            raise
         response = MsgSerializer.from_bytes(message)
 
         if "error" in response:

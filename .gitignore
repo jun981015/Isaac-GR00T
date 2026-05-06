@@ -122,3 +122,30 @@ playground/
 demo_data/gr00t-gr1-apple-to-shelf/
 tmp/
 output/
+
+# Local experiment outputs and heavyweight artifacts
+local_outputs/
+backups/
+runtime_home/
+MUJOCO_LOG.TXT
+.codex/
+.codex
+.claude/
+.claude
+wandb/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.hdf5
+*.h5
+*.npy
+*.npz
+*.mp4
+*.pid
+
+# Environment capture logs / machine-specific dumps
+envs/*.log
+envs/*pip-freeze-full.txt
+envs/*conda-list-export.txt
+envs/*apt-manual.txt

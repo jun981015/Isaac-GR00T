@@ -100,12 +100,26 @@ def _language(env) -> str:
         return ""
 
 
-def obs_to_policy(obs: dict[str, Any], env) -> dict[str, Any]:
+def resize_image(image: np.ndarray, size: int | None) -> np.ndarray:
+    if size is None or size <= 0 or image.shape[0] == size and image.shape[1] == size:
+        return image
+    try:
+        import cv2
+
+        return cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA)
+    except ImportError:
+        y_idx = np.linspace(0, image.shape[0] - 1, size).astype(np.int64)
+        x_idx = np.linspace(0, image.shape[1] - 1, size).astype(np.int64)
+        return image[y_idx][:, x_idx]
+
+
+def obs_to_policy(obs: dict[str, Any], env, image_size: int | None = None) -> dict[str, Any]:
     policy_obs: dict[str, Any] = {}
     for robocasa_key, gr00t_key in STATE_KEY_MAP.items():
         policy_obs[gr00t_key] = np.asarray(obs[robocasa_key])[None]
     for robocasa_key, gr00t_key in VIDEO_KEY_MAP.items():
         image = np.asarray(obs[robocasa_key])
+        image = resize_image(image, image_size)
         policy_obs[gr00t_key] = np.flip(image, axis=0)[None]
     policy_obs["annotation.human.action.task_description"] = np.asarray([_language(env)])
     return policy_obs
