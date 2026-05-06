@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate GR00T N1.5 RoboCasa policies through the HTTP inference server."""
+"""Evaluate GR00T N1.5 RoboCasa policies through the ZMQ inference server."""
 
 from __future__ import annotations
 
@@ -11,10 +11,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-import imageio.v2 as imageio
-import json_numpy
 import numpy as np
-import requests
+import imageio.v2 as imageio
+
+from gr00t.eval.robot import RobotInferenceClient
 
 from gr00t.eval.wrappers.robocasa_n15_wrapper import (
     RoboCasaEvalConfig,
@@ -29,8 +29,6 @@ from gr00t.eval.wrappers.robocasa_n15_wrapper import (
     success_from_env,
 )
 
-json_numpy.patch()
-
 TASKS = {
     "sink": "PnPCounterToSink",
     "stove": "PnPCounterToStove",
@@ -39,10 +37,25 @@ TASKS = {
     "microwave_thawing": "MicrowaveThawing",
     "coffee_setup_mug": "CoffeeSetupMug",
     "coffee_press_button": "CoffeePressButton",
+    "coffee_serve_mug": "CoffeeServeMug",
     "open_single_door": "OpenSingleDoor",
     "close_single_door": "CloseSingleDoor",
+    "open_double_door": "OpenDoubleDoor",
+    "close_double_door": "CloseDoubleDoor",
+    "open_drawer": "OpenDrawer",
+    "close_drawer": "CloseDrawer",
+    "cab_to_counter": "PnPCabToCounter",
+    "counter_to_cab": "PnPCounterToCab",
     "counter_to_microwave": "PnPCounterToMicrowave",
+    "sink_to_counter": "PnPSinkToCounter",
+    "stove_to_counter": "PnPStoveToCounter",
     "turn_on_microwave": "TurnOnMicrowave",
+    "turn_off_microwave": "TurnOffMicrowave",
+    "turn_on_sink_faucet": "TurnOnSinkFaucet",
+    "turn_off_sink_faucet": "TurnOffSinkFaucet",
+    "turn_sink_spout": "TurnSinkSpout",
+    "turn_on_stove": "TurnOnStove",
+    "turn_off_stove": "TurnOffStove",
 }
 
 
@@ -77,10 +90,6 @@ def env_seed(base_seed: int, episode_idx: int) -> int:
     return int(base_seed + episode_idx * 256)
 
 
-def action_seed(base_seed: int, episode_idx: int, policy_call_idx: int) -> int:
-    return int(base_seed + episode_idx * 100_000 + policy_call_idx)
-
-
 def make_eval_config(args: argparse.Namespace, episode_idx: int) -> RoboCasaEvalConfig:
     return RoboCasaEvalConfig(
         env_name=args.env_name,
@@ -89,6 +98,8 @@ def make_eval_config(args: argparse.Namespace, episode_idx: int) -> RoboCasaEval
         layout_and_style_ids=parse_layouts(args.layout_style_ids),
         camera_width=args.camera_width,
         camera_height=args.camera_height,
+        has_offscreen_renderer=args.has_offscreen_renderer,
+        use_camera_obs=args.use_camera_obs,
         randomize_cameras=args.randomize_cameras,
         generative_textures=args.generative_textures,
     )
@@ -158,40 +169,33 @@ def load_or_generate_schedule(args: argparse.Namespace) -> dict[str, Any]:
     return generate_schedule(args)
 
 
-def wait_for_server(args: argparse.Namespace) -> None:
-    url = f"http://{args.host}:{args.port}/health"
+def wait_for_server(args: argparse.Namespace) -> RobotInferenceClient:
     deadline = time.time() + args.server_timeout_sec
     last_error = None
     while time.time() < deadline:
+        client = RobotInferenceClient(
+            host=args.host,
+            port=args.port,
+            timeout_ms=args.ping_timeout_ms,
+            api_token=args.api_token,
+        )
         try:
-            response = requests.get(url, timeout=5)
-            if response.ok:
-                print(f"[server] healthy: {url}")
-                return
-            last_error = f"{response.status_code}: {response.text}"
+            if client.ping():
+                print(f"[server] healthy: zmq://{args.host}:{args.port}")
+                return RobotInferenceClient(
+                    host=args.host,
+                    port=args.port,
+                    timeout_ms=args.action_timeout_ms,
+                    api_token=args.api_token,
+                )
         except Exception as exc:
             last_error = str(exc)
         time.sleep(2)
-    raise TimeoutError(f"HTTP inference server not ready at {url}: {last_error}")
+    raise TimeoutError(f"ZMQ inference server not ready at {args.host}:{args.port}: {last_error}")
 
 
-def request_action(
-    args: argparse.Namespace,
-    obs: dict[str, Any],
-    episode_idx: int,
-    policy_call_idx: int,
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {"observation": obs}
-    if args.deterministic_action_seed:
-        action_seed_base = args.seed if args.action_seed_base is None else args.action_seed_base
-        payload["action_seed"] = action_seed(action_seed_base, episode_idx, policy_call_idx)
-    response = requests.post(
-        f"http://{args.host}:{args.port}/act",
-        json=payload,
-        timeout=args.action_timeout_sec,
-    )
-    response.raise_for_status()
-    return response.json()
+def request_action(client: RobotInferenceClient, obs: dict[str, Any]) -> dict[str, Any]:
+    return client.get_action(obs)
 
 
 def scale_video_frame(frame: np.ndarray, scale: int | float) -> np.ndarray:
@@ -238,6 +242,7 @@ class StreamingVideo:
 
 def rollout_episode(
     args: argparse.Namespace,
+    client: RobotInferenceClient,
     episode: dict[str, Any],
     task_dir: Path,
     env=None,
@@ -252,32 +257,44 @@ def rollout_episode(
     success = False
     policy_calls = 0
     env_steps = 0
+    policy_sec = 0.0
+    env_step_sec = 0.0
+    render_sec = 0.0
     start = time.time()
     reset_start = time.time()
     tmp_video_path = task_dir / "videos" / f"ep{episode_idx:03d}_seed{config.seed}_streaming_tmp.mp4"
-    stream = StreamingVideo(tmp_video_path, args.video_fps) if args.stream_video else None
+    stream = StreamingVideo(tmp_video_path, args.video_fps) if args.write_video and args.stream_video else None
     try:
         reseed_env(env, config.seed)
         set_ep_meta(env, episode["ep_meta"])
         obs = env.reset()
         reset_sec = time.time() - reset_start
         rollout_start = time.time()
-        frame = render_video_frame(args, obs, env)
-        if stream is not None:
-            stream.append(frame)
-        else:
-            frames.append(frame)
+        if args.write_video:
+            render_start = time.time()
+            frame = render_video_frame(args, obs, env)
+            render_sec += time.time() - render_start
+            if stream is not None:
+                stream.append(frame)
+            else:
+                frames.append(frame)
         while env_steps < args.max_episode_steps:
-            policy_obs = obs_to_policy(obs, env)
-            action = request_action(args, policy_obs, episode_idx, policy_calls)
+            policy_obs = obs_to_policy(obs, env, image_size=args.policy_image_size)
+            policy_start = time.time()
+            action = request_action(client, policy_obs)
+            policy_sec += time.time() - policy_start
             policy_calls += 1
             for action_idx in range(args.n_action_steps):
                 raw_action = action_dict_to_robosuite(action, action_idx)
+                env_step_start = time.time()
                 obs, _reward, done, _info = env.step(raw_action)
+                env_step_sec += time.time() - env_step_start
                 env_steps += 1
                 success = success or success_from_env(env)
-                if (env_steps % args.video_steps_per_render) == 0:
+                if args.write_video and (env_steps % args.video_steps_per_render) == 0:
+                    render_start = time.time()
                     frame = render_video_frame(args, obs, env)
+                    render_sec += time.time() - render_start
                     if stream is not None:
                         stream.append(frame)
                     else:
@@ -293,15 +310,18 @@ def rollout_episode(
         if owns_env:
             env.close()
 
-    video_start = time.time()
-    video_name = f"ep{episode_idx:03d}_seed{config.seed}_composite_outcome{int(success)}.mp4"
-    video_path = task_dir / "videos" / video_name
-    video_path.parent.mkdir(parents=True, exist_ok=True)
-    if stream is not None:
-        tmp_video_path.replace(video_path)
-    else:
-        imageio.mimsave(video_path, frames, fps=args.video_fps)
-    video_sec = time.time() - video_start
+    video_sec = 0.0
+    video_path = None
+    if args.write_video:
+        video_start = time.time()
+        video_name = f"ep{episode_idx:03d}_seed{config.seed}_composite_outcome{int(success)}.mp4"
+        video_path = task_dir / "videos" / video_name
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+        if stream is not None:
+            tmp_video_path.replace(video_path)
+        else:
+            imageio.mimsave(video_path, frames, fps=args.video_fps)
+        video_sec = time.time() - video_start
 
     metadata = {
         "env_name": args.env_name,
@@ -313,17 +333,22 @@ def rollout_episode(
         "elapsed_sec": time.time() - start,
         "reset_sec": reset_sec,
         "rollout_sec": rollout_sec,
+        "policy_sec": policy_sec,
+        "env_step_sec": env_step_sec,
+        "render_sec": render_sec,
         "video_sec": video_sec,
         "env_recreated": env_recreated,
         "scene_signature": scene_signature(episode),
-        "video_path": str(video_path),
+        "video_written": args.write_video,
+        "video_path": str(video_path) if video_path is not None else None,
         "ep_meta": episode["ep_meta"],
     }
     write_json(task_dir / "episodes" / f"ep{episode_idx:03d}.json", metadata)
     print(
         f"[episode] {args.env_name} ep={episode_idx:03d} "
         f"success={int(success)} env_steps={env_steps} policy_calls={policy_calls} "
-        f"video={video_path.name}"
+        f"policy_sec={policy_sec:.1f} env_step_sec={env_step_sec:.1f} "
+        f"render_sec={render_sec:.1f} video={video_path.name if video_path is not None else 'none'}"
     )
     return metadata
 
@@ -333,6 +358,8 @@ def existing_episode_metadata(task_dir: Path, episode_idx: int) -> dict[str, Any
     if not metadata_path.exists():
         return None
     metadata = read_json(metadata_path)
+    if metadata.get("video_written") is False:
+        return metadata
     video_path = Path(str(metadata.get("video_path", "")))
     if not video_path.is_absolute():
         video_path = task_dir / "videos" / video_path.name
@@ -344,7 +371,7 @@ def existing_episode_metadata(task_dir: Path, episode_idx: int) -> dict[str, Any
 def run_eval(args: argparse.Namespace) -> None:
     os.environ.setdefault("MUJOCO_GL", "egl")
     set_seed(args.seed)
-    wait_for_server(args)
+    client = wait_for_server(args)
     schedule = load_or_generate_schedule(args)
 
     task_dir = Path(args.output_dir) / args.env_name
@@ -356,6 +383,7 @@ def run_eval(args: argparse.Namespace) -> None:
             "schedule_path": args.schedule_path,
             "host": args.host,
             "port": args.port,
+            "transport": "zmq",
             "n_episodes": args.n_episodes,
             "n_action_steps": args.n_action_steps,
             "max_episode_steps": args.max_episode_steps,
@@ -364,9 +392,11 @@ def run_eval(args: argparse.Namespace) -> None:
             "video_render_size": args.video_render_size,
             "video_source": args.video_source,
             "video_steps_per_render": args.video_steps_per_render,
+            "camera_width": args.camera_width,
+            "camera_height": args.camera_height,
+            "policy_image_size": args.policy_image_size,
+            "write_video": args.write_video,
             "stream_video": args.stream_video,
-            "deterministic_action_seed": args.deterministic_action_seed,
-            "action_seed_base": args.action_seed_base,
             "reuse_env": args.reuse_env,
             "obj_instance_split": args.obj_instance_split,
             "layout_style_ids": parse_layouts(args.layout_style_ids),
@@ -393,6 +423,7 @@ def run_eval(args: argparse.Namespace) -> None:
                 results.append(
                     rollout_episode(
                         args,
+                        client,
                         episode,
                         task_dir,
                         env=env,
@@ -414,7 +445,7 @@ def run_eval(args: argparse.Namespace) -> None:
                     )
                     results.append(metadata)
                     continue
-            results.append(rollout_episode(args, episode, task_dir))
+            results.append(rollout_episode(args, client, episode, task_dir))
 
     successes = [bool(item["success"]) for item in results]
     summary = {
@@ -424,6 +455,10 @@ def run_eval(args: argparse.Namespace) -> None:
         "success_rate": float(np.mean(successes)) if successes else 0.0,
         "total_env_steps": int(sum(item["env_steps"] for item in results)),
         "total_policy_calls": int(sum(item["policy_calls"] for item in results)),
+        "total_policy_sec": float(sum(item.get("policy_sec", 0.0) for item in results)),
+        "total_env_step_sec": float(sum(item.get("env_step_sec", 0.0) for item in results)),
+        "total_render_sec": float(sum(item.get("render_sec", 0.0) for item in results)),
+        "total_video_sec": float(sum(item.get("video_sec", 0.0) for item in results)),
         "results": results,
     }
     write_json(task_dir / "summary.json", summary)
@@ -441,12 +476,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--schedule_path", required=True)
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument(
-        "--action_seed_base",
-        type=int,
-        default=None,
-        help="Base seed for policy action sampling. Defaults to --seed so env schedule replay is unchanged.",
-    )
     parser.add_argument("--n_episodes", type=int, default=50)
     parser.add_argument("--n_action_steps", type=int, default=16)
     parser.add_argument("--max_episode_steps", type=int, default=800)
@@ -455,23 +484,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--video_render_size",
         type=int,
-        default=512,
+        default=256,
         help="Output video height per camera. With --video_source render this is true sim.render size; with obs it upscales policy obs.",
     )
     parser.add_argument("--video_source", choices=("obs", "render"), default="obs")
-    parser.add_argument("--video_steps_per_render", type=int, default=1)
+    parser.add_argument("--video_steps_per_render", type=int, default=4)
+    parser.add_argument("--policy_image_size", type=int, default=128)
+    parser.add_argument("--no_video", dest="write_video", action="store_false")
     parser.add_argument("--stream_video", action="store_true")
-    parser.add_argument(
-        "--no_deterministic_action_seed",
-        dest="deterministic_action_seed",
-        action="store_false",
-        help="Disable per-episode/per-policy-call torch seed sent to the policy server.",
-    )
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--no_reuse_env", dest="reuse_env", action="store_false")
     parser.set_defaults(reuse_env=True)
-    parser.add_argument("--camera_width", type=int, default=128)
-    parser.add_argument("--camera_height", type=int, default=128)
+    parser.add_argument("--camera_width", type=int, default=256)
+    parser.add_argument("--camera_height", type=int, default=256)
+    parser.add_argument("--no_offscreen_renderer", dest="has_offscreen_renderer", action="store_false")
+    parser.add_argument("--no_camera_obs", dest="use_camera_obs", action="store_false")
+    parser.set_defaults(has_offscreen_renderer=True, use_camera_obs=True)
     parser.add_argument("--obj_instance_split", default="A")
     parser.add_argument("--generative_textures", default=None)
     parser.add_argument(
@@ -483,8 +511,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--regenerate_schedule", action="store_true")
     parser.add_argument("--generate_schedule_only", action="store_true")
     parser.add_argument("--server_timeout_sec", type=int, default=300)
-    parser.add_argument("--action_timeout_sec", type=int, default=120)
-    parser.set_defaults(deterministic_action_seed=True)
+    parser.add_argument("--ping_timeout_ms", type=int, default=5000)
+    parser.add_argument("--action_timeout_ms", type=int, default=120000)
+    parser.add_argument("--api_token", default=None)
     return parser
 
 

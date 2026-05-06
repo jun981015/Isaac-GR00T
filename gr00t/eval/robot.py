@@ -13,11 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import random
 from typing import Any, Dict
 
-from gr00t.data.dataset import ModalityConfig
+import numpy as np
+
 from gr00t.eval.service import BaseInferenceClient, BaseInferenceServer
-from gr00t.model.policy import BasePolicy
 
 
 class RobotInferenceServer(BaseInferenceServer):
@@ -27,27 +28,55 @@ class RobotInferenceServer(BaseInferenceServer):
 
     def __init__(self, model, host: str = "*", port: int = 5555, api_token: str = None):
         super().__init__(host, port, api_token)
+        self.model = model
         self.register_endpoint("get_action", model.get_action)
+        self.register_endpoint("get_action_seeded", self.get_action_seeded)
         self.register_endpoint(
             "get_modality_config", model.get_modality_config, requires_input=False
         )
 
+    def get_action_seeded(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        import torch
+
+        seed = int(payload["action_seed"])
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        return self.model.get_action(payload["observation"])
+
     @staticmethod
-    def start_server(policy: BasePolicy, port: int, api_token: str = None):
+    def start_server(policy: Any, port: int, api_token: str = None):
         server = RobotInferenceServer(policy, port=port, api_token=api_token)
         server.run()
 
 
-class RobotInferenceClient(BaseInferenceClient, BasePolicy):
+class RobotInferenceClient(BaseInferenceClient):
     """
     Client for communicating with the RealRobotServer
     """
 
-    def __init__(self, host: str = "localhost", port: int = 5555, api_token: str = None):
-        super().__init__(host=host, port=port, api_token=api_token)
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 5555,
+        timeout_ms: int = 15000,
+        api_token: str = None,
+    ):
+        super().__init__(host=host, port=port, timeout_ms=timeout_ms, api_token=api_token)
 
     def get_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         return self.call_endpoint("get_action", observations)
 
-    def get_modality_config(self) -> Dict[str, ModalityConfig]:
+    def get_action_seeded(self, observations: Dict[str, Any], action_seed: int) -> Dict[str, Any]:
+        return self.call_endpoint(
+            "get_action_seeded",
+            {
+                "observation": observations,
+                "action_seed": int(action_seed),
+            },
+        )
+
+    def get_modality_config(self) -> Dict[str, Any]:
         return self.call_endpoint("get_modality_config", requires_input=False)

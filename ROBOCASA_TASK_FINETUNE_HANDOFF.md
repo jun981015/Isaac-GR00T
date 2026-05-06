@@ -1039,3 +1039,56 @@ Do not rely on folder names like official_32k to infer what actually ran; inspec
 For exact checkpoint step, trust checkpoint-*/trainer_state.json global_step.
 For standard BC, check that no sample contains loss_weight/reward.
 ```
+
+## 20. Conda Finetune Smoke After Docker Replacement
+
+On 2026-04-30 KST, the Docker-equivalent conda env `groot-smoke` was validated with an actual GR00T RoboCasa finetune path.
+
+Historical note: the one-step check used a temporary smoke-only copy of `scripts/gr00t_finetune.py` that skipped checkpoint/final model saving. That temporary script was intentionally removed after validation; use `scripts/gr00t_finetune.py` or `scripts/robocasa_awr_finetune.py` for actual training.
+
+Run scope:
+
+```text
+env: groot-smoke
+GPU: CUDA_VISIBLE_DEVICES=1
+tasks:
+  /home/junhyeong/data/robocasa_lerobot/PnPCounterToSink
+  /home/junhyeong/data/robocasa_lerobot/PnPCounterToStove
+  /home/junhyeong/data/robocasa_lerobot/PnPMicrowaveToCounter
+data config: robocasa_n15_data_config:RobocasaKitchenPnPDataConfig
+base model: /home/junhyeong/.cache/huggingface/models--nvidia--GR00T-N1.5-3B/snapshots/869830fc749c35f34771aa5209f923ac57e4564e
+batch_size: 1
+max_steps: 1
+gradient_accumulation_steps: 1
+LoRA: off
+tune_llm: False
+tune_visual: False
+tune_projector: False
+tune_diffusion_model: True
+video_backend: torchcodec
+report_to: tensorboard
+```
+
+Observed result:
+
+```text
+3 datasets initialized and mixed.
+GR00T checkpoint shards loaded.
+Backbone/VLM frozen.
+Projector frozen.
+Action diffusion/DiT trainable.
+One train step completed.
+train_loss: 0.6214311122894287
+final model save skipped.
+```
+
+Smoke output:
+
+```text
+/home/junhyeong/Value/Isaac-GR00T/local_outputs/conda_smoke/groot_smoke_1step_20260430_223117.log
+/home/junhyeong/Value/Isaac-GR00T/local_outputs/conda_smoke/groot_smoke_1step_20260430_223117/trainer_state.json
+/home/junhyeong/Value/Isaac-GR00T/local_outputs/conda_smoke/groot_smoke_1step_20260430_223117/experiment_cfg/metadata.json
+/home/junhyeong/Value/Isaac-GR00T/local_outputs/conda_smoke/groot_smoke_1step_20260430_223117/runs/
+```
+
+No `model*.safetensors`, `optimizer.pt`, or large checkpoint files were written. The output directory was about 68KB.

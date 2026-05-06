@@ -4,6 +4,7 @@
 import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ import numpy as np
 import pandas as pd
 import torch
 import tyro
-from transformers import TrainingArguments
+from transformers import TrainerCallback, TrainingArguments
 
 from gr00t.data.dataset import LeRobotMixtureDataset, LeRobotSingleDataset
 from gr00t.data.schema import EmbodimentTag
@@ -57,16 +58,163 @@ class ArgsConfig:
     balance_dataset_weights: bool = True
     balance_trajectory_weights: bool = True
     awr_alpha: float = 20.0
-    awr_clip_max: float = 2.0
+    awr_clip_max: float = 1.8
+    task_alpha_map: str = (
+        "PrepareCoffee=50,MicrowaveThawing=70,"
+        "CoffeeSetupMug=40,PnPCounterToMicrowave=40,"
+        "CoffeePressButton=20,OpenSingleDoor=20,CloseSingleDoor=20,TurnOnMicrowave=20"
+    )
+    critical_mass: float = 0.8
+    critical_radius: int = 16
     pick_mass: float = 0.3
     place_mass: float = 0.3
     other_mass: float = 0.4
     gripper_stuck_window: int = 10
     gripper_stuck_threshold: float = 0.001
-    action_chunk_delta_count: int = 15
+    action_chunk_delta_count: int = 16
     place_offset: int = 8
     pick_radius: int = 2
     place_radius: int = 2
+    compact_checkpoints_on_save: bool = False
+    compact_base_model_path: str = ""
+    compact_link_base_model_path: str = ""
+    compact_final_model: bool = True
+    compact_fail_fast: bool = True
+
+
+def compact_model_weights_in_place(
+    checkpoint_dir: Path,
+    base_model_path: Path,
+    *,
+    link_base_model_path: Path | None = None,
+    fail_fast: bool = True,
+) -> bool:
+    """Replace only model safetensors with compact symlink-backed shards.
+
+    Non-model training files such as optimizer.pt, scheduler.pt, rng states,
+    trainer_state.json, and experiment_cfg are intentionally left untouched.
+    """
+
+    checkpoint_dir = checkpoint_dir.resolve()
+    base_model_path = base_model_path.resolve()
+    if link_base_model_path is not None:
+        link_base_model_path = link_base_model_path.expanduser()
+    if (checkpoint_dir / "compact_summary.json").exists():
+        print(f"[compact] skip already compact: {checkpoint_dir}", flush=True)
+        return True
+    if not (checkpoint_dir / "model.safetensors.index.json").exists():
+        print(f"[compact] skip missing model index: {checkpoint_dir}", flush=True)
+        return False
+    if not (base_model_path / "model.safetensors.index.json").exists():
+        message = f"[compact] base model index missing: {base_model_path}"
+        if fail_fast:
+            raise FileNotFoundError(message)
+        print(message, flush=True)
+        return False
+
+    repo_dir = Path(__file__).resolve().parents[1]
+    compact_script = repo_dir / "scripts" / "compact_groot_checkpoint.py"
+    tmp_dir = checkpoint_dir / ".compact_tmp"
+    backup_dir = checkpoint_dir / ".model_full_backup_tmp"
+    if tmp_dir.exists() or backup_dir.exists():
+        message = f"[compact] temp path exists for {checkpoint_dir}: {tmp_dir} {backup_dir}"
+        if fail_fast:
+            raise FileExistsError(message)
+        print(message, flush=True)
+        return False
+
+    try:
+        print(f"[compact] start model weight compact: {checkpoint_dir}", flush=True)
+        subprocess.run(
+            [
+                sys.executable,
+                str(compact_script),
+                "--checkpoint",
+                str(checkpoint_dir),
+                "--base",
+                str(base_model_path),
+                *(
+                    ["--link-base", str(link_base_model_path)]
+                    if link_base_model_path is not None
+                    else []
+                ),
+                "--output",
+                str(tmp_dir),
+            ],
+            check=True,
+            cwd=repo_dir,
+        )
+        required = [
+            tmp_dir / "model.safetensors.index.json",
+            tmp_dir / "model-changed.safetensors",
+            tmp_dir / "compact_summary.json",
+        ]
+        if not all(path.exists() for path in required):
+            raise RuntimeError(f"compact output missing required model files: {tmp_dir}")
+
+        backup_dir.mkdir()
+        old_model_files = list(checkpoint_dir.glob("model*.safetensors")) + [
+            checkpoint_dir / "model.safetensors.index.json"
+        ]
+        for path in old_model_files:
+            if path.exists():
+                path.rename(backup_dir / path.name)
+
+        compact_model_files = (
+            list(tmp_dir.glob("base-*.safetensors"))
+            + [
+                tmp_dir / "model-changed.safetensors",
+                tmp_dir / "model.safetensors.index.json",
+                tmp_dir / "compact_summary.json",
+            ]
+        )
+        for path in compact_model_files:
+            if path.exists() or path.is_symlink():
+                path.rename(checkpoint_dir / path.name)
+
+        shutil.rmtree(tmp_dir)
+        shutil.rmtree(backup_dir)
+        print(f"[compact] done model weight compact: {checkpoint_dir}", flush=True)
+        return True
+    except Exception as exc:
+        if backup_dir.exists():
+            for path in backup_dir.iterdir():
+                target = checkpoint_dir / path.name
+                if not target.exists():
+                    path.rename(target)
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        if backup_dir.exists():
+            shutil.rmtree(backup_dir, ignore_errors=True)
+        if fail_fast:
+            raise
+        print(f"[compact] failed for {checkpoint_dir}: {exc}", flush=True)
+        return False
+
+
+class CompactModelWeightsCallback(TrainerCallback):
+    def __init__(
+        self,
+        base_model_path: str,
+        link_base_model_path: str = "",
+        fail_fast: bool = True,
+    ):
+        self.base_model_path = Path(base_model_path).expanduser()
+        self.link_base_model_path = (
+            Path(link_base_model_path).expanduser() if link_base_model_path else None
+        )
+        self.fail_fast = fail_fast
+
+    def on_save(self, args, state, control, **kwargs):
+        if not getattr(state, "is_world_process_zero", True):
+            return
+        checkpoint_dir = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+        compact_model_weights_in_place(
+            checkpoint_dir,
+            self.base_model_path,
+            link_base_model_path=self.link_base_model_path,
+            fail_fast=self.fail_fast,
+        )
 
 
 class AWRLeRobotSingleDataset(LeRobotSingleDataset):
@@ -75,6 +223,9 @@ class AWRLeRobotSingleDataset(LeRobotSingleDataset):
         *args,
         awr_alpha: float,
         awr_clip_max: float,
+        task_alpha_map: str,
+        critical_mass: float,
+        critical_radius: int,
         pick_mass: float,
         place_mass: float,
         other_mass: float,
@@ -89,6 +240,11 @@ class AWRLeRobotSingleDataset(LeRobotSingleDataset):
         super().__init__(*args, **kwargs)
         self.awr_alpha = awr_alpha
         self.awr_clip_max = awr_clip_max
+        self.task_alpha_map = self._parse_task_alpha_map(task_alpha_map)
+        self.task_name = self.dataset_path.name
+        self.task_alpha = self.task_alpha_map.get(self.task_name, awr_alpha)
+        self.critical_mass = critical_mass
+        self.critical_radius = critical_radius
         self.pick_mass = pick_mass
         self.place_mass = place_mass
         self.other_mass = other_mass
@@ -99,6 +255,17 @@ class AWRLeRobotSingleDataset(LeRobotSingleDataset):
         self.pick_radius = pick_radius
         self.place_radius = place_radius
         self._loss_weights = self._precompute_loss_weights()
+
+    @staticmethod
+    def _parse_task_alpha_map(raw: str) -> dict[str, float]:
+        mapping = {}
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            key, value = item.split("=", 1)
+            mapping[key.strip()] = float(value)
+        return mapping
 
     @staticmethod
     def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -114,7 +281,7 @@ class AWRLeRobotSingleDataset(LeRobotSingleDataset):
             runs.append((start, len(mask) - 1))
         return runs
 
-    def _episode_arrays(self, trajectory_id: int) -> tuple[np.ndarray, np.ndarray]:
+    def _episode_arrays(self, trajectory_id: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         parquet_path = self.dataset_path / self.data_path_pattern.format(
             episode_chunk=self.get_episode_chunk(trajectory_id),
             episode_index=trajectory_id,
@@ -123,12 +290,17 @@ class AWRLeRobotSingleDataset(LeRobotSingleDataset):
         modality = json.loads((self.dataset_path / "meta/modality.json").read_text())
         action_cfg = modality["action"]["gripper"]
         state_cfg = modality["state"]["gripper_qpos"]
+        eef_rel_cfg = modality["state"].get("end_effector_position_relative")
         action = np.stack(df[action_cfg["original_key"]].to_numpy())
         state = np.stack(df[state_cfg["original_key"]].to_numpy())
         gripper_action = action[:, action_cfg["start"] : action_cfg["end"]].reshape(-1)
         gripper_qpos = state[:, state_cfg["start"] : state_cfg["end"]]
         gripper_gap = np.abs(gripper_qpos[:, 0] - gripper_qpos[:, 1])
-        return gripper_action, gripper_gap
+        if eef_rel_cfg is None:
+            eef_x_relative = np.zeros(len(action), dtype=np.float32)
+        else:
+            eef_x_relative = state[:, eef_rel_cfg["start"]].astype(np.float32)
+        return gripper_action, gripper_gap, eef_x_relative
 
     def _detect_pick_place(self, gripper_action: np.ndarray, gripper_gap: np.ndarray) -> tuple[int, int]:
         closing_runs = [(s, e) for s, e in self._runs(gripper_action > 0) if e - s + 1 >= 3]
@@ -150,20 +322,118 @@ class AWRLeRobotSingleDataset(LeRobotSingleDataset):
                 break
         return pick_frame, place_open_frame
 
-    def _progress_delta(self, length: int, pick_frame: int, place_open_frame: int) -> np.ndarray:
+    def _first_stuck_gap(self, gripper_gap: np.ndarray, start: int, end: int) -> int:
+        for frame in range(start, max(start, end - self.gripper_stuck_window + 2)):
+            window = gripper_gap[frame : frame + self.gripper_stuck_window]
+            if len(window) == self.gripper_stuck_window and window.max() - window.min() <= self.gripper_stuck_threshold:
+                return frame
+        return end
+
+    @staticmethod
+    def _smooth(values: np.ndarray, window: int = 9) -> np.ndarray:
+        pad = window // 2
+        padded = np.pad(values, (pad, pad), mode="edge")
+        return np.convolve(padded, np.ones(window, dtype=np.float32) / window, mode="valid")
+
+    @staticmethod
+    def _local_peaks(values: np.ndarray, min_prominence: float = 0.01) -> list[int]:
+        peaks = []
+        for idx in range(1, len(values) - 1):
+            if values[idx] >= values[idx - 1] and values[idx] > values[idx + 1]:
+                left = max(0, idx - 10)
+                right = min(len(values), idx + 11)
+                prominence = values[idx] - min(values[left : idx + 1].min(), values[idx:right].min())
+                if prominence >= min_prominence:
+                    peaks.append(idx)
+        return peaks
+
+    def _prepare_coffee_press(self, eef_x_relative: np.ndarray) -> int:
+        smoothed_x = self._smooth(eef_x_relative, window=9)
+        min_frame = int(round((len(eef_x_relative) - 1) * 0.85))
+        late_peaks = [peak for peak in self._local_peaks(smoothed_x, min_prominence=0.01) if peak >= min_frame]
+        if late_peaks:
+            return int(late_peaks[-1])
+        return int(min_frame + np.argmax(smoothed_x[min_frame:]))
+
+    def _detect_task_events(
+        self,
+        trajectory_id: int,
+        gripper_action: np.ndarray,
+        gripper_gap: np.ndarray,
+        eef_x_relative: np.ndarray,
+    ) -> list[tuple[str, int]]:
+        closing_runs = [(s, e) for s, e in self._runs(gripper_action > 0) if e - s + 1 >= 3]
+        opening_runs_3 = [(s, e) for s, e in self._runs(gripper_action < 0) if e - s + 1 >= 3]
+        opening_runs_5 = [(s, e) for s, e in self._runs(gripper_action < 0) if e - s + 1 >= 5]
+        length = len(gripper_action)
+
+        def first_pick() -> int:
+            return self._first_stuck_gap(gripper_gap, *closing_runs[0]) if closing_runs else length // 3
+
+        def first_open_after(frame: int, min_len_5: bool = False) -> int:
+            openings = opening_runs_5 if min_len_5 else opening_runs_3
+            return int(next((start for start, _ in openings if start > frame), openings[-1][0] if openings else min(length - 1, frame + 1)))
+
+        if self.task_name == "PrepareCoffee":
+            pick = first_pick()
+            place = first_open_after(pick)
+            return [("pick", pick), ("place", place), ("press", self._prepare_coffee_press(eef_x_relative))]
+
+        if self.task_name == "CoffeeSetupMug":
+            pick = first_pick()
+            return [("pick", pick), ("place", first_open_after(pick))]
+
+        if self.task_name == "CoffeePressButton":
+            press = opening_runs_3[-1][0] if opening_runs_3 else length - 1
+            return [("press", int(press))]
+
+        if self.task_name == "MicrowaveThawing":
+            open_door_pick = first_pick()
+            if int(trajectory_id) == 10 and len(closing_runs) >= 3:
+                pnp_close = closing_runs[2]
+            elif len(closing_runs) >= 2:
+                pnp_close = closing_runs[1]
+            else:
+                pnp_close = closing_runs[-1] if closing_runs else (length // 3, length // 3)
+            object_pick = self._first_stuck_gap(gripper_gap, *pnp_close)
+            object_place = first_open_after(object_pick)
+            close_frame = int(object_place + np.argmin(eef_x_relative[object_place:]))
+            press = length - 1
+            return [
+                ("open_door_first_pick", open_door_pick),
+                ("pick_after_door", object_pick),
+                ("place_after_door", object_place),
+                ("close", close_frame),
+                ("press", press),
+            ]
+
+        if self.task_name == "OpenSingleDoor":
+            return [("door_pick", first_pick())]
+
+        if self.task_name == "CloseSingleDoor":
+            return [("close", int(np.argmin(eef_x_relative)))]
+
+        if self.task_name == "PnPCounterToMicrowave":
+            pick = first_pick()
+            return [("pick", pick), ("place", first_open_after(pick))]
+
+        if self.task_name == "TurnOnMicrowave":
+            return [("press", int(np.argmax(eef_x_relative)))]
+
+        # Backward-compatible fallback for old PnP tasks.
+        pick, place_open = self._detect_pick_place(gripper_action, gripper_gap)
+        return [("pick", pick), ("place", place_open + self.place_offset)]
+
+    def _progress_delta(self, length: int, events: list[tuple[str, int]]) -> np.ndarray:
         event_delta = np.zeros(length, dtype=np.float32)
-        pick_frames = np.arange(pick_frame - self.pick_radius, pick_frame + self.pick_radius + 1)
-        place_center = place_open_frame + self.place_offset
-        place_frames = np.arange(place_center - self.place_radius, place_center + self.place_radius + 1)
-        pick_frames = pick_frames[(0 <= pick_frames) & (pick_frames < length)]
-        place_frames = place_frames[(0 <= place_frames) & (place_frames < length)]
-        if len(pick_frames) > 0:
-            event_delta[pick_frames] += self.pick_mass / len(pick_frames)
-        if len(place_frames) > 0:
-            event_delta[place_frames] += self.place_mass / len(place_frames)
-        non_event = event_delta == 0
-        if non_event.any():
-            event_delta[non_event] = self.other_mass / non_event.sum()
+        if not events:
+            return event_delta
+        event_mass = self.critical_mass / len(events)
+        for _name, center in events:
+            frames = np.arange(center - self.critical_radius, center + self.critical_radius + 1)
+            frames = frames[(0 <= frames) & (frames < length)]
+            if len(frames) > 0:
+                event_delta[frames] += event_mass / len(frames)
         return event_delta
 
     def _precompute_loss_weights(self) -> dict[tuple[int, int], float]:
@@ -171,23 +441,24 @@ class AWRLeRobotSingleDataset(LeRobotSingleDataset):
         raw_means = []
         final_weights = []
         for trajectory_id, length in zip(self.trajectory_ids, self.trajectory_lengths):
-            gripper_action, gripper_gap = self._episode_arrays(int(trajectory_id))
-            pick_frame, place_open_frame = self._detect_pick_place(gripper_action, gripper_gap)
-            progress_delta = self._progress_delta(int(length), pick_frame, place_open_frame)
+            gripper_action, gripper_gap, eef_x_relative = self._episode_arrays(int(trajectory_id))
+            events = self._detect_task_events(int(trajectory_id), gripper_action, gripper_gap, eef_x_relative)
+            progress_delta = self._progress_delta(int(length), events)
             for base_index in range(int(length)):
                 idx = np.minimum(
                     np.arange(base_index, base_index + self.action_chunk_delta_count),
                     int(length) - 1,
                 )
                 mean_delta = float(progress_delta[idx].mean())
-                weight = float(np.clip(np.exp(self.awr_alpha * mean_delta), 0.0, self.awr_clip_max))
+                weight = float(np.clip(np.exp(self.task_alpha * mean_delta), 1.0, self.awr_clip_max))
                 weights[(int(trajectory_id), base_index)] = weight
                 raw_means.append(mean_delta)
                 final_weights.append(weight)
         print(
             f"[AWR] {self.dataset_name}: mean_delta min/max={min(raw_means):.6f}/{max(raw_means):.6f}, "
-            f"weight min/max={min(final_weights):.6f}/{max(final_weights):.6f}, alpha={self.awr_alpha}, "
-            f"pick_radius={self.pick_radius}, place_radius={self.place_radius}"
+            f"weight mean/min/max={np.mean(final_weights):.6f}/{min(final_weights):.6f}/{max(final_weights):.6f}, "
+            f"alpha={self.task_alpha}, clip_max={self.awr_clip_max}, task={self.task_name}, "
+            f"critical_mass={self.critical_mass}, critical_radius={self.critical_radius}"
         )
         return weights
 
@@ -214,6 +485,9 @@ def build_dataset(config: ArgsConfig):
             video_backend=config.video_backend,
             awr_alpha=config.awr_alpha,
             awr_clip_max=config.awr_clip_max,
+            task_alpha_map=config.task_alpha_map,
+            critical_mass=config.critical_mass,
+            critical_radius=config.critical_radius,
             pick_mass=config.pick_mass,
             place_mass=config.place_mass,
             other_mass=config.other_mass,
@@ -343,7 +617,26 @@ def main(config: ArgsConfig):
         training_args=training_args,
         resume_from_checkpoint=config.resume,
     )
+    compact_base_model_path = config.compact_base_model_path or config.base_model_path
+    compact_link_base_model_path = config.compact_link_base_model_path
+    if config.compact_checkpoints_on_save:
+        experiment.trainer.add_callback(
+            CompactModelWeightsCallback(
+                base_model_path=compact_base_model_path,
+                link_base_model_path=compact_link_base_model_path,
+                fail_fast=config.compact_fail_fast,
+            )
+        )
     experiment.train()
+    if config.compact_checkpoints_on_save and config.compact_final_model:
+        compact_model_weights_in_place(
+            Path(config.output_dir),
+            Path(compact_base_model_path),
+            link_base_model_path=(
+                Path(compact_link_base_model_path) if compact_link_base_model_path else None
+            ),
+            fail_fast=config.compact_fail_fast,
+        )
 
 
 if __name__ == "__main__":
