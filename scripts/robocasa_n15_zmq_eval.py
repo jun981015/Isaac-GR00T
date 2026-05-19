@@ -18,6 +18,7 @@ from gr00t.eval.robot import RobotInferenceClient
 
 from gr00t.eval.wrappers.robocasa_n15_wrapper import (
     RoboCasaEvalConfig,
+    STATE_KEY_MAP,
     action_dict_to_robosuite,
     create_robocasa_env,
     get_ep_meta,
@@ -227,6 +228,14 @@ def render_video_frame(args: argparse.Namespace, obs: dict[str, Any], env) -> np
     return scale_video_frame(frame, args.video_scale)
 
 
+def obs_to_state_policy(obs: dict[str, Any]) -> dict[str, np.ndarray]:
+    """GR00T state-only observation at one env step; images are stored via mp4."""
+    return {
+        gr00t_key: np.asarray(obs[robocasa_key])[None]
+        for robocasa_key, gr00t_key in STATE_KEY_MAP.items()
+    }
+
+
 class StreamingVideo:
     def __init__(self, path: Path, fps: int):
         self.path = path
@@ -238,6 +247,146 @@ class StreamingVideo:
 
     def close(self) -> None:
         self.writer.close()
+
+
+def _squeeze_batch(array: Any) -> np.ndarray:
+    value = np.asarray(array)
+    if value.shape[:1] == (1,):
+        return value[0]
+    return value
+
+
+class RolloutIORecorder:
+    """Collect exact policy inputs / outputs for later offline training."""
+
+    def __init__(self, *, enabled: bool, path: Path, metadata: dict[str, Any]):
+        self.enabled = enabled
+        self.path = path
+        self.metadata = metadata
+        self.policy_obs: dict[str, list[np.ndarray]] = {}
+        self.policy_actions: dict[str, list[np.ndarray]] = {}
+        self.policy_call_env_steps: list[int] = []
+        self.policy_call_indices: list[int] = []
+        self.policy_seeds: list[int] = []
+        self.step_obs: dict[str, list[np.ndarray]] = {}
+        self.raw_actions: list[np.ndarray] = []
+        self.action_indices: list[int] = []
+        self.action_policy_call_indices: list[int] = []
+        self.rewards: list[float] = []
+        self.dones: list[bool] = []
+        self.successes: list[bool] = []
+
+    def record_policy_call(
+        self,
+        *,
+        policy_obs: dict[str, Any],
+        action: dict[str, Any],
+        env_step: int,
+        policy_call_idx: int,
+        policy_seed: int | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        for key, value in policy_obs.items():
+            if key == "annotation.human.action.task_description":
+                continue
+            if key.startswith("video."):
+                continue
+            self.policy_obs.setdefault(key, []).append(_squeeze_batch(value).copy())
+        for key, value in action.items():
+            self.policy_actions.setdefault(key, []).append(_squeeze_batch(value).copy())
+        self.policy_call_env_steps.append(int(env_step))
+        self.policy_call_indices.append(int(policy_call_idx))
+        self.policy_seeds.append(-1 if policy_seed is None else int(policy_seed))
+
+    def record_step_obs(self, *, obs: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        for key, value in obs.items():
+            if key.startswith("video."):
+                continue
+            self.step_obs.setdefault(key, []).append(_squeeze_batch(value).copy())
+
+    def record_env_step(
+        self,
+        *,
+        raw_action: np.ndarray,
+        action_idx: int,
+        policy_call_idx: int,
+        reward: float,
+        done: bool,
+        success: bool,
+    ) -> None:
+        if not self.enabled:
+            return
+        self.raw_actions.append(np.asarray(raw_action, dtype=np.float32).copy())
+        self.action_indices.append(int(action_idx))
+        self.action_policy_call_indices.append(int(policy_call_idx))
+        self.rewards.append(float(reward))
+        self.dones.append(bool(done))
+        self.successes.append(bool(success))
+
+    def write(self, final_metadata: dict[str, Any]) -> Path | None:
+        if not self.enabled:
+            return None
+        try:
+            import h5py
+        except ImportError as exc:
+            raise ImportError("--save_rollout_hdf5 requires h5py in the eval environment") from exc
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        string_dtype = h5py.string_dtype(encoding="utf-8")
+        with h5py.File(self.path, "w") as h5:
+            h5.attrs["format"] = "gr00t_robocasa_eval_rollout_io_v1"
+            h5.attrs["description"] = (
+                "Policy-call-level GR00T inputs and predicted action chunks, "
+                "plus per-env-step raw actions actually executed in RoboCasa. "
+                "Image observations are intentionally omitted; use metadata/video_path mp4 instead."
+            )
+            meta = h5.create_group("metadata")
+            combined = {**self.metadata, **final_metadata}
+            for key, value in combined.items():
+                if key == "ep_meta":
+                    meta.attrs[key] = json.dumps(jsonable(value), ensure_ascii=False)
+                elif isinstance(value, (dict, list, tuple)):
+                    meta.attrs[key] = json.dumps(jsonable(value), ensure_ascii=False)
+                elif value is None:
+                    meta.attrs[key] = ""
+                else:
+                    meta.attrs[key] = value
+
+            prompt = str(combined.get("ep_meta", {}).get("lang", ""))
+            h5.create_dataset("prompt", data=prompt, dtype=string_dtype)
+            h5.create_dataset("video_path", data=str(combined.get("video_path", "")), dtype=string_dtype)
+
+            policy = h5.create_group("policy")
+            policy.create_dataset("call_env_step", data=np.asarray(self.policy_call_env_steps, dtype=np.int32))
+            policy.create_dataset("call_index", data=np.asarray(self.policy_call_indices, dtype=np.int32))
+            policy.create_dataset("call_seed", data=np.asarray(self.policy_seeds, dtype=np.int64))
+            obs_group = policy.create_group("obs")
+            for key, values in sorted(self.policy_obs.items()):
+                obs_group.create_dataset(key, data=np.stack(values), compression="lzf")
+            action_group = policy.create_group("action_pred")
+            for key, values in sorted(self.policy_actions.items()):
+                action_group.create_dataset(key, data=np.stack(values), compression="lzf")
+
+            steps = h5.create_group("env_steps")
+            step_obs_group = steps.create_group("obs")
+            for key, values in sorted(self.step_obs.items()):
+                step_obs_group.create_dataset(key, data=np.stack(values), compression="lzf")
+            if self.raw_actions:
+                steps.create_dataset("raw_action", data=np.stack(self.raw_actions), compression="lzf")
+            else:
+                steps.create_dataset("raw_action", data=np.zeros((0, 0), dtype=np.float32))
+            steps.create_dataset("action_idx", data=np.asarray(self.action_indices, dtype=np.int32))
+            steps.create_dataset(
+                "policy_call_idx",
+                data=np.asarray(self.action_policy_call_indices, dtype=np.int32),
+            )
+            steps.create_dataset("reward", data=np.asarray(self.rewards, dtype=np.float32))
+            steps.create_dataset("done", data=np.asarray(self.dones, dtype=np.bool_))
+            steps.create_dataset("success", data=np.asarray(self.successes, dtype=np.bool_))
+        return self.path
 
 
 def rollout_episode(
@@ -264,6 +413,19 @@ def rollout_episode(
     reset_start = time.time()
     tmp_video_path = task_dir / "videos" / f"ep{episode_idx:03d}_seed{config.seed}_streaming_tmp.mp4"
     stream = StreamingVideo(tmp_video_path, args.video_fps) if args.write_video and args.stream_video else None
+    hdf5_path = task_dir / "hdf5" / f"ep{episode_idx:03d}_seed{config.seed}_rollout_io.hdf5"
+    recorder = RolloutIORecorder(
+        enabled=args.save_rollout_hdf5,
+        path=hdf5_path,
+        metadata={
+            "env_name": args.env_name,
+            "episode_idx": episode_idx,
+            "seed": config.seed,
+            "ep_meta": episode["ep_meta"],
+            "n_action_steps": args.n_action_steps,
+            "policy_image_size": args.policy_image_size,
+        },
+    )
     try:
         reseed_env(env, config.seed)
         set_ep_meta(env, episode["ep_meta"])
@@ -283,14 +445,29 @@ def rollout_episode(
             policy_start = time.time()
             action = request_action(client, policy_obs)
             policy_sec += time.time() - policy_start
+            recorder.record_policy_call(
+                policy_obs=policy_obs,
+                action=action,
+                env_step=env_steps,
+                policy_call_idx=policy_calls,
+            )
             policy_calls += 1
             for action_idx in range(args.n_action_steps):
+                recorder.record_step_obs(obs=obs_to_state_policy(obs))
                 raw_action = action_dict_to_robosuite(action, action_idx)
                 env_step_start = time.time()
-                obs, _reward, done, _info = env.step(raw_action)
+                obs, reward, done, _info = env.step(raw_action)
                 env_step_sec += time.time() - env_step_start
                 env_steps += 1
                 success = success or success_from_env(env)
+                recorder.record_env_step(
+                    raw_action=raw_action,
+                    action_idx=action_idx,
+                    policy_call_idx=policy_calls - 1,
+                    reward=float(reward),
+                    done=bool(done),
+                    success=bool(success),
+                )
                 if args.write_video and (env_steps % args.video_steps_per_render) == 0:
                     render_start = time.time()
                     frame = render_video_frame(args, obs, env)
@@ -341,8 +518,11 @@ def rollout_episode(
         "scene_signature": scene_signature(episode),
         "video_written": args.write_video,
         "video_path": str(video_path) if video_path is not None else None,
+        "rollout_hdf5_written": args.save_rollout_hdf5,
+        "rollout_hdf5_path": str(hdf5_path) if args.save_rollout_hdf5 else None,
         "ep_meta": episode["ep_meta"],
     }
+    recorder.write(metadata)
     write_json(task_dir / "episodes" / f"ep{episode_idx:03d}.json", metadata)
     print(
         f"[episode] {args.env_name} ep={episode_idx:03d} "
@@ -395,6 +575,7 @@ def run_eval(args: argparse.Namespace) -> None:
             "camera_width": args.camera_width,
             "camera_height": args.camera_height,
             "policy_image_size": args.policy_image_size,
+            "save_rollout_hdf5": args.save_rollout_hdf5,
             "write_video": args.write_video,
             "stream_video": args.stream_video,
             "reuse_env": args.reuse_env,
@@ -413,6 +594,10 @@ def run_eval(args: argparse.Namespace) -> None:
                 episode_idx = int(episode["episode_idx"])
                 if args.skip_existing:
                     metadata = existing_episode_metadata(task_dir, episode_idx)
+                    if metadata is not None and args.save_rollout_hdf5:
+                        hdf5_path = Path(str(metadata.get("rollout_hdf5_path", "")))
+                        if not hdf5_path.exists():
+                            metadata = None
                     if metadata is not None:
                         print(
                             f"[skip] {args.env_name} ep={episode_idx:03d} "
@@ -438,6 +623,10 @@ def run_eval(args: argparse.Namespace) -> None:
             episode_idx = int(episode["episode_idx"])
             if args.skip_existing:
                 metadata = existing_episode_metadata(task_dir, episode_idx)
+                if metadata is not None and args.save_rollout_hdf5:
+                    hdf5_path = Path(str(metadata.get("rollout_hdf5_path", "")))
+                    if not hdf5_path.exists():
+                        metadata = None
                 if metadata is not None:
                     print(
                         f"[skip] {args.env_name} ep={episode_idx:03d} "
@@ -490,6 +679,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video_source", choices=("obs", "render"), default="obs")
     parser.add_argument("--video_steps_per_render", type=int, default=4)
     parser.add_argument("--policy_image_size", type=int, default=128)
+    parser.add_argument(
+        "--save_rollout_hdf5",
+        action="store_true",
+        help="Save policy inputs, predicted action chunks, and executed raw actions for every episode.",
+    )
     parser.add_argument("--no_video", dest="write_video", action="store_false")
     parser.add_argument("--stream_video", action="store_true")
     parser.add_argument("--skip_existing", action="store_true")

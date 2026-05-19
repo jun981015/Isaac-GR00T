@@ -24,6 +24,8 @@ VIDEO_STEPS_PER_RENDER="${VIDEO_STEPS_PER_RENDER:-4}"
 CAMERA_WIDTH="${CAMERA_WIDTH:-256}"
 CAMERA_HEIGHT="${CAMERA_HEIGHT:-256}"
 POLICY_IMAGE_SIZE="${POLICY_IMAGE_SIZE:-128}"
+CAMERA_ABLATION="${CAMERA_ABLATION:-none}"
+SAVE_ROLLOUT_HDF5="${SAVE_ROLLOUT_HDF5:-0}"
 WRITE_VIDEO="${WRITE_VIDEO:-1}"
 STREAM_VIDEO="${STREAM_VIDEO:-1}"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"
@@ -54,6 +56,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
 export PYTHONPATH="${REPO_DIR}:${ROBOCASA_DIR}:${PYTHONPATH:-}"
 
 mkdir -p "${OUTPUT_DIR}" "${SCHEDULE_DIR}"
@@ -73,6 +76,9 @@ if [[ "${WRITE_VIDEO}" == "0" ]]; then
 fi
 if [[ "${SKIP_EXISTING}" == "1" ]]; then
   EXTRA_ARGS+=(--skip_existing)
+fi
+if [[ "${SAVE_ROLLOUT_HDF5}" == "1" ]]; then
+  EXTRA_ARGS+=(--save_rollout_hdf5)
 fi
 if [[ "${USE_CAMERA_OBS}" == "0" ]]; then
   EXTRA_ARGS+=(--no_camera_obs)
@@ -113,6 +119,7 @@ conda run --no-capture-output -n "${CONDA_ENV}" python scripts/robocasa_n15_zmq_
   --camera_width "${CAMERA_WIDTH}" \
   --camera_height "${CAMERA_HEIGHT}" \
   --policy_image_size "${POLICY_IMAGE_SIZE}" \
+  --camera_ablation "${CAMERA_ABLATION}" \
   --obj_instance_split "${OBJ_INSTANCE_SPLIT}" \
   --layout_style_ids "${LAYOUT_STYLE_IDS}" \
   --server_timeout_sec "${SERVER_TIMEOUT_SEC}" \

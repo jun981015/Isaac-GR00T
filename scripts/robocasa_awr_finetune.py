@@ -57,6 +57,12 @@ class ArgsConfig:
     video_backend: Literal["torchcodec", "decord", "torchvision_av"] = "torchcodec"
     balance_dataset_weights: bool = True
     balance_trajectory_weights: bool = True
+    awr_source: Literal["heuristic", "annotation"] = "heuristic"
+    annotation_root: str = ""
+    annotation_version: str = "v1"
+    annotation_split: str = "validated"
+    annotation_camera: str = "robot0_agentview_left"
+    annotation_r: float = 5.0
     awr_alpha: float = 20.0
     awr_clip_max: float = 1.8
     task_alpha_map: str = (
@@ -235,6 +241,12 @@ class AWRLeRobotSingleDataset(LeRobotSingleDataset):
         place_offset: int,
         pick_radius: int,
         place_radius: int,
+        awr_source: str,
+        annotation_root: str,
+        annotation_version: str,
+        annotation_split: str,
+        annotation_camera: str,
+        annotation_r: float,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -254,6 +266,12 @@ class AWRLeRobotSingleDataset(LeRobotSingleDataset):
         self.place_offset = place_offset
         self.pick_radius = pick_radius
         self.place_radius = place_radius
+        self.awr_source = awr_source
+        self.annotation_root = Path(annotation_root).expanduser() if annotation_root else None
+        self.annotation_version = annotation_version
+        self.annotation_split = annotation_split
+        self.annotation_camera = annotation_camera
+        self.annotation_r = annotation_r
         self._loss_weights = self._precompute_loss_weights()
 
     @staticmethod
@@ -266,6 +284,22 @@ class AWRLeRobotSingleDataset(LeRobotSingleDataset):
             key, value = item.split("=", 1)
             mapping[key.strip()] = float(value)
         return mapping
+
+    @staticmethod
+    def _annotation_task_name(task_name: str) -> str:
+        return task_name.lower()
+
+    @staticmethod
+    def _slopes_for_r(critical_length: float, noncritical_length: float, r: float) -> tuple[float, float]:
+        if critical_length <= 0.0 and noncritical_length <= 0.0:
+            raise ValueError("annotation has zero total duration")
+        if noncritical_length <= 0.0:
+            return 1.0 / critical_length, 0.0
+        if critical_length <= 0.0:
+            return 0.0, 1.0 / noncritical_length
+        noncritical_slope = 1.0 / (r * critical_length + noncritical_length)
+        critical_slope = r * noncritical_slope
+        return critical_slope, noncritical_slope
 
     @staticmethod
     def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -424,6 +458,117 @@ class AWRLeRobotSingleDataset(LeRobotSingleDataset):
         pick, place_open = self._detect_pick_place(gripper_action, gripper_gap)
         return [("pick", pick), ("place", place_open + self.place_offset)]
 
+    def _annotation_path(self, trajectory_id: int) -> Path:
+        if self.annotation_root is None:
+            raise FileNotFoundError("annotation_root is empty")
+        task = self._annotation_task_name(self.task_name)
+        new_path = (
+            self.annotation_root
+            / task
+            / self.annotation_version
+            / self.annotation_split
+            / f"{task}_episode_{trajectory_id:06d}.json"
+        )
+        if new_path.exists():
+            return new_path
+
+        validated_dir = self.annotation_root / task / self.annotation_split
+        cameras = [
+            self.annotation_camera,
+            "robot0_agentview_left",
+            "robot0_agentview_right",
+            "robot0_eye_in_hand",
+        ]
+        seen = set()
+        for camera in cameras:
+            if camera in seen:
+                continue
+            seen.add(camera)
+            path = validated_dir / f"{task}_episode_{trajectory_id:06d}_{camera}.json"
+            if path.exists():
+                return path
+        return new_path
+
+    def _load_annotation(self, trajectory_id: int) -> dict:
+        path = self._annotation_path(trajectory_id)
+        if not path.exists():
+            raise FileNotFoundError(f"missing annotation for AWR: {path}")
+        return json.loads(path.read_text())
+
+    def _episode_timestamps(self, trajectory_id: int) -> np.ndarray:
+        parquet_path = self.dataset_path / self.data_path_pattern.format(
+            episode_chunk=self.get_episode_chunk(trajectory_id),
+            episode_index=trajectory_id,
+        )
+        df = pd.read_parquet(parquet_path, columns=["timestamp"])
+        return df["timestamp"].to_numpy(dtype=np.float64)
+
+    @staticmethod
+    def _annotation_segments(annotation: dict) -> tuple[list[tuple[float, float, bool]], float]:
+        duration = float(annotation["duration_sec"])
+        if "tasks_time" in annotation:
+            critical_tasks = set(annotation["critical_tasks"])
+            return [
+                (
+                    max(0.0, min(float(segment["start_sec"]), duration)),
+                    max(0.0, min(float(segment["end_sec"]), duration)),
+                    segment["task"] in critical_tasks,
+                )
+                for segment in annotation["tasks_time"]
+            ], duration
+
+        critical_intervals = []
+        for idx, item in enumerate(annotation.get("critical_tasks") or []):
+            start = max(0.0, min(float(item.get("start_sec", 0.0)), duration))
+            end = max(start, min(float(item.get("end_sec", start)), duration))
+            if end > start:
+                critical_intervals.append((start, end, idx))
+        critical_intervals.sort()
+
+        segments = []
+        cursor = 0.0
+        for start, end, _idx in critical_intervals:
+            if start > cursor:
+                segments.append((cursor, start, False))
+            segments.append((start, end, True))
+            cursor = max(cursor, end)
+        if cursor < duration:
+            segments.append((cursor, duration, False))
+        return segments, duration
+
+    def _annotation_progress_delta(self, trajectory_id: int) -> np.ndarray:
+        annotation = self._load_annotation(trajectory_id)
+        timestamps = self._episode_timestamps(trajectory_id)
+        if len(timestamps) == 0:
+            raise ValueError(f"empty timestamps for {self.dataset_path} episode {trajectory_id}")
+
+        segments, duration = self._annotation_segments(annotation)
+        critical_length = sum(end - start for start, end, is_critical in segments if is_critical)
+        noncritical_length = sum(end - start for start, end, is_critical in segments if not is_critical)
+        critical_slope, noncritical_slope = self._slopes_for_r(
+            critical_length, noncritical_length, self.annotation_r
+        )
+
+        if len(timestamps) == 1:
+            frame_ends = np.asarray([duration], dtype=np.float64)
+        else:
+            frame_ends = np.empty_like(timestamps, dtype=np.float64)
+            frame_ends[:-1] = timestamps[1:]
+            frame_ends[-1] = duration
+        frame_starts = np.clip(timestamps, 0.0, duration)
+        frame_ends = np.clip(np.maximum(frame_ends, frame_starts), 0.0, duration)
+
+        delta = np.zeros(len(timestamps), dtype=np.float64)
+        for start, end, is_critical in segments:
+            slope = critical_slope if is_critical else noncritical_slope
+            overlap = np.maximum(0.0, np.minimum(frame_ends, end) - np.maximum(frame_starts, start))
+            delta += slope * overlap
+
+        total = float(delta.sum())
+        if total <= 0.0:
+            raise ValueError(f"zero annotation progress delta for {self.dataset_path} episode {trajectory_id}")
+        return (delta / total).astype(np.float32)
+
     def _progress_delta(self, length: int, events: list[tuple[str, int]]) -> np.ndarray:
         event_delta = np.zeros(length, dtype=np.float32)
         if not events:
@@ -440,10 +585,17 @@ class AWRLeRobotSingleDataset(LeRobotSingleDataset):
         weights = {}
         raw_means = []
         final_weights = []
+        annotation_count = 0
+        heuristic_count = 0
         for trajectory_id, length in zip(self.trajectory_ids, self.trajectory_lengths):
             gripper_action, gripper_gap, eef_x_relative = self._episode_arrays(int(trajectory_id))
-            events = self._detect_task_events(int(trajectory_id), gripper_action, gripper_gap, eef_x_relative)
-            progress_delta = self._progress_delta(int(length), events)
+            if self.awr_source == "annotation":
+                progress_delta = self._annotation_progress_delta(int(trajectory_id))
+                annotation_count += 1
+            else:
+                events = self._detect_task_events(int(trajectory_id), gripper_action, gripper_gap, eef_x_relative)
+                progress_delta = self._progress_delta(int(length), events)
+                heuristic_count += 1
             for base_index in range(int(length)):
                 idx = np.minimum(
                     np.arange(base_index, base_index + self.action_chunk_delta_count),
@@ -458,7 +610,8 @@ class AWRLeRobotSingleDataset(LeRobotSingleDataset):
             f"[AWR] {self.dataset_name}: mean_delta min/max={min(raw_means):.6f}/{max(raw_means):.6f}, "
             f"weight mean/min/max={np.mean(final_weights):.6f}/{min(final_weights):.6f}/{max(final_weights):.6f}, "
             f"alpha={self.task_alpha}, clip_max={self.awr_clip_max}, task={self.task_name}, "
-            f"critical_mass={self.critical_mass}, critical_radius={self.critical_radius}"
+            f"critical_mass={self.critical_mass}, critical_radius={self.critical_radius}, "
+            f"annotation_count={annotation_count}, heuristic_count={heuristic_count}"
         )
         return weights
 
@@ -497,6 +650,12 @@ def build_dataset(config: ArgsConfig):
             place_offset=config.place_offset,
             pick_radius=config.pick_radius,
             place_radius=config.place_radius,
+            awr_source=config.awr_source,
+            annotation_root=config.annotation_root,
+            annotation_version=config.annotation_version,
+            annotation_split=config.annotation_split,
+            annotation_camera=config.annotation_camera,
+            annotation_r=config.annotation_r,
         )
 
     if len(config.dataset_path) == 1:

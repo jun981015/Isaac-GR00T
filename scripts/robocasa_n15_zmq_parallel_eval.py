@@ -26,6 +26,7 @@ from gr00t.eval.wrappers.robocasa_n15_wrapper import (
     success_from_env,
 )
 from scripts.robocasa_n15_zmq_eval import (
+    RolloutIORecorder,
     TASKS,
     StreamingVideo,
     existing_episode_metadata,
@@ -34,6 +35,7 @@ from scripts.robocasa_n15_zmq_eval import (
     jsonable,
     load_or_generate_schedule,
     make_eval_config,
+    obs_to_state_policy,
     parse_layouts,
     read_json,
     render_video_frame,
@@ -46,6 +48,34 @@ from scripts.robocasa_n15_zmq_eval import (
 
 def action_seed(base_seed: int, episode_idx: int, policy_call_idx: int) -> int:
     return int(base_seed + episode_idx * 100_000 + policy_call_idx)
+
+
+STATIC_CAMERA_KEYS = (
+    "video.robot0_agentview_left",
+    "video.robot0_agentview_right",
+)
+HAND_CAMERA_KEYS = ("video.robot0_eye_in_hand",)
+
+
+def mask_policy_cameras(policy_obs: dict[str, Any], mode: str) -> dict[str, Any]:
+    """Ablate policy camera inputs without changing env observations or videos."""
+    if mode == "none":
+        return policy_obs
+    if mode == "no_hand":
+        keys = HAND_CAMERA_KEYS
+    elif mode == "no_static":
+        keys = STATIC_CAMERA_KEYS
+    elif mode == "hand_only":
+        keys = STATIC_CAMERA_KEYS
+    elif mode == "static_only":
+        keys = HAND_CAMERA_KEYS
+    else:
+        raise ValueError(f"Unsupported camera_ablation mode: {mode}")
+
+    for key in keys:
+        if key in policy_obs:
+            policy_obs[key] = np.zeros_like(policy_obs[key])
+    return policy_obs
 
 
 def rollout_worker_episode(
@@ -69,6 +99,19 @@ def rollout_worker_episode(
     reset_start = time.time()
     tmp_video_path = task_dir / "videos" / f"ep{episode_idx:03d}_seed{config.seed}_streaming_tmp.mp4"
     stream = StreamingVideo(tmp_video_path, args.video_fps) if args.write_video and args.stream_video else None
+    hdf5_path = task_dir / "hdf5" / f"ep{episode_idx:03d}_seed{config.seed}_rollout_io.hdf5"
+    recorder = RolloutIORecorder(
+        enabled=args.save_rollout_hdf5,
+        path=hdf5_path,
+        metadata={
+            "env_name": args.env_name,
+            "episode_idx": episode_idx,
+            "seed": config.seed,
+            "ep_meta": episode["ep_meta"],
+            "n_action_steps": args.n_action_steps,
+            "policy_image_size": args.policy_image_size,
+        },
+    )
     try:
         reseed_env(env, config.seed)
         set_ep_meta(env, episode["ep_meta"])
@@ -86,6 +129,7 @@ def rollout_worker_episode(
 
         while env_steps < args.max_episode_steps:
             policy_obs = obs_to_policy(obs, env, image_size=args.policy_image_size)
+            policy_obs = mask_policy_cameras(policy_obs, args.camera_ablation)
             wait_start = time.time()
             conn.send(
                 {
@@ -99,16 +143,33 @@ def rollout_worker_episode(
             policy_wait_sec += time.time() - wait_start
             if not isinstance(action, dict) or "action" not in action:
                 raise RuntimeError(f"Unexpected action response: {type(action)}")
-            action = action["action"]
+            action_response = action
+            action = action_response["action"]
+            recorder.record_policy_call(
+                policy_obs=policy_obs,
+                action=action,
+                env_step=env_steps,
+                policy_call_idx=policy_calls,
+                policy_seed=action_response.get("policy_seed"),
+            )
             policy_calls += 1
 
             for action_idx in range(args.n_action_steps):
+                recorder.record_step_obs(obs=obs_to_state_policy(obs))
                 raw_action = action_dict_to_robosuite(action, action_idx)
                 env_step_start = time.time()
-                obs, _reward, done, _info = env.step(raw_action)
+                obs, reward, done, _info = env.step(raw_action)
                 env_step_sec += time.time() - env_step_start
                 env_steps += 1
                 success = success or success_from_env(env)
+                recorder.record_env_step(
+                    raw_action=raw_action,
+                    action_idx=action_idx,
+                    policy_call_idx=policy_calls - 1,
+                    reward=float(reward),
+                    done=bool(done),
+                    success=bool(success),
+                )
                 if args.write_video and (env_steps % args.video_steps_per_render) == 0:
                     render_start = time.time()
                     frame = render_video_frame(args, obs, env)
@@ -158,8 +219,12 @@ def rollout_worker_episode(
         "scene_signature": scene_signature(episode),
         "video_written": args.write_video,
         "video_path": str(video_path) if video_path is not None else None,
+        "rollout_hdf5_written": args.save_rollout_hdf5,
+        "rollout_hdf5_path": str(hdf5_path) if args.save_rollout_hdf5 else None,
+        "camera_ablation": args.camera_ablation,
         "ep_meta": episode["ep_meta"],
     }
+    recorder.write(metadata)
     write_json(task_dir / "episodes" / f"ep{episode_idx:03d}.json", metadata)
     return metadata
 
@@ -238,25 +303,27 @@ def request_seeded_action_batch(
     client: RobotInferenceClient,
     requests: list[dict[str, Any]],
     base_seed: int,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int]:
     if len(requests) == 1:
         request = requests[0]
+        seed = action_seed(
+            base_seed,
+            int(request["episode_idx"]),
+            int(request["policy_call_idx"]),
+        )
         action = client.get_action_seeded(
             request["policy_obs"],
-            action_seed=action_seed(
-                base_seed,
-                int(request["episode_idx"]),
-                int(request["policy_call_idx"]),
-            ),
+            action_seed=seed,
         )
-        return [action]
+        return [action], seed
 
     batched_obs = batch_policy_observations(requests)
+    seed = batch_seed(base_seed, requests)
     action = client.get_action_seeded(
         batched_obs,
-        action_seed=batch_seed(base_seed, requests),
+        action_seed=seed,
     )
-    return split_action_batch(action, len(requests))
+    return split_action_batch(action, len(requests)), seed
 
 
 def write_summary(args: argparse.Namespace, task_dir: Path, results: list[dict[str, Any]]) -> None:
@@ -313,6 +380,8 @@ def run_eval(args: argparse.Namespace) -> None:
             "camera_width": args.camera_width,
             "camera_height": args.camera_height,
             "policy_image_size": args.policy_image_size,
+            "save_rollout_hdf5": args.save_rollout_hdf5,
+            "camera_ablation": args.camera_ablation,
             "write_video": args.write_video,
             "stream_video": args.stream_video,
             "obj_instance_split": args.obj_instance_split,
@@ -328,6 +397,10 @@ def run_eval(args: argparse.Namespace) -> None:
         episode_idx = int(episode["episode_idx"])
         if args.skip_existing:
             metadata = existing_episode_metadata(task_dir, episode_idx)
+            if metadata is not None and args.save_rollout_hdf5:
+                hdf5_path = Path(str(metadata.get("rollout_hdf5_path", "")))
+                if not hdf5_path.exists():
+                    metadata = None
             if metadata is not None:
                 print(
                     f"[skip] {args.env_name} ep={episode_idx:03d} "
@@ -450,14 +523,15 @@ def run_eval(args: argparse.Namespace) -> None:
 
                 action_conns = [conn for conn, _msg in action_requests]
                 request_payloads = [msg for _conn, msg in action_requests]
-                actions = request_seeded_action_batch(client, request_payloads, args.seed)
+                actions, policy_seed = request_seeded_action_batch(client, request_payloads, args.seed)
                 print(
                     f"[policy_batch] size={len(actions)} "
                     f"episodes={[int(msg['episode_idx']) for msg in request_payloads]} "
-                    f"calls={[int(msg['policy_call_idx']) for msg in request_payloads]}"
+                    f"calls={[int(msg['policy_call_idx']) for msg in request_payloads]} "
+                    f"seed={policy_seed}"
                 )
                 for conn, action in zip(action_conns, actions):
-                    conn.send({"action": action})
+                    conn.send({"action": action, "policy_seed": policy_seed})
                 action_requests.clear()
     finally:
         for _worker_idx, proc, conn in workers:
@@ -496,6 +570,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video_source", choices=("obs", "render"), default="obs")
     parser.add_argument("--video_steps_per_render", type=int, default=4)
     parser.add_argument("--policy_image_size", type=int, default=128)
+    parser.add_argument(
+        "--save_rollout_hdf5",
+        action="store_true",
+        help="Save policy inputs, predicted action chunks, and executed raw actions for every episode.",
+    )
+    parser.add_argument(
+        "--camera_ablation",
+        choices=("none", "no_hand", "no_static", "hand_only", "static_only"),
+        default="none",
+        help="Zero selected camera inputs before sending observations to the policy.",
+    )
     parser.add_argument("--no_video", dest="write_video", action="store_false")
     parser.add_argument("--stream_video", action="store_true")
     parser.add_argument("--skip_existing", action="store_true")
