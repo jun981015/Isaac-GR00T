@@ -15,8 +15,9 @@ The practical transport policy is:
 
 ```text
 run name: ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1
-local run dir: /home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1
-checkpoint: /home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1/checkpoint-50000
+repo-relative run dir: local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1
+repo-relative checkpoint: local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1/checkpoint-50000
+server 50 source run dir: /home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1
 local size: 7.1G
 ```
 
@@ -64,9 +65,13 @@ together.
 ## Upload Command
 
 ```bash
+cd /path/to/Isaac-GR00T
+
+RUN_DIR=local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1
+
 conda run -n groot-smoke hf upload \
   RLobot-jun/groot-robocasa-checkpoints \
-  /home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1/checkpoint-50000 \
+  "${RUN_DIR}/checkpoint-50000" \
   server_50/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1/checkpoint-50000 \
   --repo-type model \
   --commit-message "Upload ann24 AWR weight1 checkpoint-50000"
@@ -76,13 +81,17 @@ If the default Xet cache is not writable on the shared server, use a user-owned
 Xet cache path:
 
 ```bash
+cd /path/to/Isaac-GR00T
+
 mkdir -p /home/junhyeong/.cache/huggingface_jun_upload/xet
+
+RUN_DIR=local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1
 
 conda run -n groot-smoke env \
   HF_XET_CACHE=/home/junhyeong/.cache/huggingface_jun_upload/xet \
   hf upload \
   RLobot-jun/groot-robocasa-checkpoints \
-  /home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1/checkpoint-50000 \
+  "${RUN_DIR}/checkpoint-50000" \
   server_50/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1/checkpoint-50000 \
   --repo-type model \
   --commit-message "Upload ann24 AWR weight1 checkpoint-50000"
@@ -98,10 +107,14 @@ stored again. The existing compact checkpoint utility can identify and extract
 changed tensors:
 
 ```bash
+cd /path/to/Isaac-GR00T
+
+RUN_DIR=local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1
+
 conda run -n groot-smoke python scripts/compact_groot_checkpoint.py \
-  --checkpoint /home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1/checkpoint-50000 \
+  --checkpoint "${RUN_DIR}/checkpoint-50000" \
   --base /home/junhyeong/.cache/huggingface/models--nvidia--GR00T-N1.5-3B/snapshots/869830fc749c35f34771aa5209f923ac57e4564e \
-  --output /home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1/checkpoint-50000-compact
+  --output "${RUN_DIR}/checkpoint-50000-compact"
 ```
 
 The compact output writes:
@@ -136,13 +149,17 @@ Use this command on another server to restore the checkpoint under the same
 local run directory layout:
 
 ```bash
-mkdir -p /home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1
+cd /path/to/Isaac-GR00T
+
+RUN_DIR=local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1
+
+mkdir -p "${RUN_DIR}"
 
 conda run -n groot-smoke hf download \
   RLobot-jun/groot-robocasa-checkpoints \
   --repo-type model \
   --include "server_50/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1/checkpoint-50000/**" \
-  --local-dir /home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1
+  --local-dir "${RUN_DIR}"
 ```
 
 The download command preserves the `server_50/.../checkpoint-50000` prefix
@@ -150,11 +167,11 @@ inside `--local-dir`. If a script expects `checkpoint-50000` directly under the
 run directory, move or rsync the downloaded checkpoint folder into place:
 
 ```bash
-mkdir -p /home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1/checkpoint-50000
+mkdir -p "${RUN_DIR}/checkpoint-50000"
 
 rsync -a \
-  /home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1/server_50/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1/checkpoint-50000/ \
-  /home/junhyeong/Value/Isaac-GR00T/local_outputs/robocasa_awr_retrain/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1/checkpoint-50000/
+  "${RUN_DIR}/server_50/ann24_awrsrc_annotation_r1_alpha0_b64_50000step_gpu1_20260504_weight1/checkpoint-50000/" \
+  "${RUN_DIR}/checkpoint-50000/"
 ```
 
 ## Resume Limitations
