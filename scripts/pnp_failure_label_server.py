@@ -93,6 +93,8 @@ def discover_items(eval_root: Path, tasks: list[str]) -> list[dict[str, object]]
             continue
         parsed = parse_video_name(video)
         rel = video.relative_to(eval_root).as_posix()
+        fast_video = video.parents[1] / "videos_fast" / video.name
+        display_rel = fast_video.relative_to(eval_root).as_posix() if fast_video.exists() else rel
         episode_idx = parsed["episode_idx"]
         hdf5_path = None
         episode_json = None
@@ -106,7 +108,8 @@ def discover_items(eval_root: Path, tasks: list[str]) -> list[dict[str, object]]
         items.append(
             {
                 "id": rel,
-                "video": rel,
+                "video": display_rel,
+                "original_video": rel,
                 "task": task,
                 "action_seed": action_seed,
                 "episode_idx": episode_idx,
@@ -153,6 +156,10 @@ HTML = r"""<!doctype html>
     .card h3 { margin: 0 0 8px 0; font-size: 13px; color: var(--muted); }
     .help { color: var(--muted); font-size: 12px; line-height: 1.5; }
     .stats { color: var(--muted); font-size: 12px; line-height: 1.5; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: #0d0f11; }
+    .stats.hidden { display: none; }
+    .statsToggle { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 12px; font-weight: 700; }
+    .episodeJump { border-color: #4a4030; }
+    .titleActions { display: flex; gap: 8px; align-items: center; }
     .taskStats { width: 100%; border-collapse: collapse; margin-top: 8px; }
     .taskStats th, .taskStats td { text-align: left; padding: 3px 4px; border-bottom: 1px solid #23262b; font-size: 11px; }
     .taskStats th { color: var(--text); font-weight: 700; }
@@ -175,8 +182,11 @@ HTML = r"""<!doctype html>
         <select id="statusFilter">
           <option value="">all labels</option>
           <option value="unlabeled">unlabeled</option>
+          <option value="labeled">labeled</option>
         </select>
-        <div class="stats" id="filterStats">stats loading...</div>
+        <select id="episodeSelect" class="episodeJump"><option value="">episodes loading...</option></select>
+        <button class="statsToggle" id="statsToggle" type="button"><span>Show progress stats</span><span id="statsSummary">loading...</span></button>
+        <div class="stats hidden" id="filterStats">stats loading...</div>
       </div>
       <div id="list"></div>
     </aside>
@@ -186,7 +196,10 @@ HTML = r"""<!doctype html>
           <h2 id="headline">Select a video</h2>
           <div class="path" id="subhead"></div>
         </div>
-        <button id="saveBtn">Save note</button>
+        <div class="titleActions">
+          <button id="nextBtn">Next</button>
+          <button id="saveBtn">Save note</button>
+        </div>
       </div>
       <video id="video" controls preload="metadata"></video>
       <div class="buttons" id="labelButtons"></div>
@@ -204,9 +217,11 @@ HTML = r"""<!doctype html>
     let labelMap = {};
     let filtered = [];
     let idx = 0;
+    let statsVisible = false;
 
     const el = (id) => document.getElementById(id);
     const itemLabel = (item) => labelMap[item.id]?.label || "";
+    const itemTitle = (item) => `${item.task} ep${String(item.episode_idx).padStart(3,'0')} | seed=${item.action_seed} | ${itemLabel(item) || 'unlabeled'}`;
 
     async function load() {
       const res = await fetch('/api/items');
@@ -219,6 +234,10 @@ HTML = r"""<!doctype html>
         b.onclick = () => setLabel(value);
         b.dataset.value = value;
         el('labelButtons').appendChild(b);
+        const o = document.createElement('option');
+        o.value = `label:${value}`;
+        o.textContent = text;
+        el('statusFilter').appendChild(o);
       });
       const tasks = [...new Set(items.map(x => x.task))].sort();
       tasks.forEach(t => {
@@ -231,12 +250,23 @@ HTML = r"""<!doctype html>
         o.value = s; o.textContent = `action_seed_${s}`; el('seedFilter').appendChild(o);
       });
       ['search','taskFilter','seedFilter','statusFilter'].forEach(id => el(id).oninput = renderList);
+      el('episodeSelect').onchange = () => {
+        const target = filtered.findIndex(item => item.id === el('episodeSelect').value);
+        if (target >= 0) select(target);
+      };
+      el('statsToggle').onclick = () => {
+        statsVisible = !statsVisible;
+        el('filterStats').classList.toggle('hidden', !statsVisible);
+        el('statsToggle').querySelector('span').textContent = statsVisible ? 'Hide progress stats' : 'Show progress stats';
+      };
+      el('nextBtn').onclick = () => select(idx + 1);
       el('saveBtn').onclick = () => saveCurrent();
       renderList();
       select(0);
     }
 
     function renderList() {
+      const selectedId = filtered[idx]?.id || "";
       const q = el('search').value.toLowerCase();
       const task = el('taskFilter').value;
       const seed = el('seedFilter').value;
@@ -247,8 +277,14 @@ HTML = r"""<!doctype html>
         if (task && item.task !== task) return false;
         if (seed && item.action_seed !== seed) return false;
         if (status === 'unlabeled' && label) return false;
+        if (status === 'labeled' && !label) return false;
+        if (status.startsWith('label:') && label !== status.slice('label:'.length)) return false;
         return !q || text.includes(q);
       });
+      const keptIndex = selectedId ? filtered.findIndex(item => item.id === selectedId) : idx;
+      if (keptIndex >= 0) idx = keptIndex;
+      else idx = 0;
+      if (idx >= filtered.length) idx = Math.max(0, filtered.length - 1);
       const list = el('list');
       list.innerHTML = '';
       filtered.forEach((item, i) => {
@@ -258,9 +294,26 @@ HTML = r"""<!doctype html>
         d.innerHTML = `<b>${item.task}</b> ep${String(item.episode_idx).padStart(3,'0')}<div class="meta">action_seed=${item.action_seed} env_seed=${item.env_seed}</div><div class="label">${itemLabel(item) || 'unlabeled'}</div>`;
         list.appendChild(d);
       });
+      const episodeSelect = el('episodeSelect');
+      episodeSelect.innerHTML = '';
+      if (!filtered.length) {
+        const o = document.createElement('option');
+        o.value = '';
+        o.textContent = 'no matching episodes';
+        episodeSelect.appendChild(o);
+      } else {
+        filtered.forEach((item) => {
+          const o = document.createElement('option');
+          o.value = item.id;
+          o.textContent = itemTitle(item);
+          episodeSelect.appendChild(o);
+        });
+        episodeSelect.value = filtered[idx]?.id || filtered[0].id;
+      }
       const labeled = items.filter(x => itemLabel(x)).length;
       el('count').textContent = `${labeled}/${items.length} labeled, ${filtered.length} shown`;
       const filteredLabeled = filtered.filter(x => itemLabel(x)).length;
+      el('statsSummary').textContent = `${filteredLabeled}/${filtered.length}`;
       const byLabel = {};
       filtered.forEach(x => {
         const label = itemLabel(x) || 'unlabeled';
@@ -293,7 +346,7 @@ HTML = r"""<!doctype html>
       el('subhead').textContent = `action_seed=${item.action_seed}, env_seed=${item.env_seed}`;
       el('video').src = `/media/${encodeURIComponent(item.id)}`;
       el('note').value = labelMap[item.id]?.note || '';
-      el('paths').innerHTML = `video: ${item.video}<br/>hdf5: ${item.hdf5 || ''}<br/>episode: ${item.episode_json || ''}`;
+      el('paths').innerHTML = `video: ${item.video}<br/>original: ${item.original_video || item.video}<br/>hdf5: ${item.hdf5 || ''}<br/>episode: ${item.episode_json || ''}`;
       updateButtons();
       renderList();
     }
@@ -326,7 +379,7 @@ HTML = r"""<!doctype html>
     }
 
     document.addEventListener('keydown', (e) => {
-      if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
+      if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
       if (e.key >= '1' && e.key <= '7') setLabel(labels[Number(e.key)-1][0]);
       if (e.key === 'j' || e.key === 'J') select(idx + 1);
       if (e.key === 'k' || e.key === 'K') select(idx - 1);

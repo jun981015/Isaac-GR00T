@@ -16,7 +16,7 @@
 import json
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Literal, Optional, Union
 
 import numpy as np
 import torch
@@ -69,6 +69,9 @@ class Gr00tPolicy(BasePolicy):
         modality_config: Dict[str, ModalityConfig],
         modality_transform: ComposedModalityTransform,
         denoising_steps: Optional[int] = None,
+        outcome_conditioning: Literal["none", "success", "guidance"] = "none",
+        outcome_prompt_style: Literal["prefix", "failure_tag"] = "prefix",
+        cfg_guidance_scale: float = 1.0,
         device: Union[int, str] = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         """
@@ -97,6 +100,9 @@ class Gr00tPolicy(BasePolicy):
         self._modality_transform.eval()  # set this to eval mode
         self.model_path = Path(model_path)
         self.device = device
+        self.outcome_conditioning = outcome_conditioning
+        self.outcome_prompt_style = outcome_prompt_style
+        self.cfg_guidance_scale = float(cfg_guidance_scale)
 
         # Convert string embodiment tag to EmbodimentTag enum if needed
         if isinstance(embodiment_tag, str):
@@ -177,8 +183,14 @@ class Gr00tPolicy(BasePolicy):
             if not isinstance(v, np.ndarray):
                 obs_copy[k] = np.array(v)
 
-        normalized_input = self.apply_transforms(obs_copy)
-        normalized_action = self._get_action_from_normalized_input(normalized_input)
+        if self.outcome_conditioning == "success":
+            obs_copy = self._rewrite_language(obs_copy, "success")
+
+        if self.outcome_conditioning == "guidance":
+            normalized_action = self._get_cfg_guided_action(obs_copy)
+        else:
+            normalized_input = self.apply_transforms(obs_copy)
+            normalized_action = self._get_action_from_normalized_input(normalized_input)
         unnormalized_action = self._get_unnormalized_action(normalized_action)
 
         if not is_batch:
@@ -192,6 +204,123 @@ class Gr00tPolicy(BasePolicy):
 
         normalized_action = model_pred["action_pred"].float()
         return normalized_action
+
+    @staticmethod
+    def _language_key() -> str:
+        return "annotation.human.action.task_description"
+
+    def _format_outcome_prompt(self, prompt: str, outcome: str) -> str:
+        if self.outcome_prompt_style == "failure_tag":
+            failure_state = "detected" if outcome == "failure" else "none"
+            return f"{prompt}\n<failure> {failure_state} </failure>"
+        return f"{outcome}: {prompt}"
+
+    def _rewrite_language(self, obs: Dict[str, Any], outcome: str | None) -> Dict[str, Any]:
+        if outcome is None:
+            return obs
+        key = self._language_key()
+        if key not in obs:
+            return obs
+
+        obs = obs.copy()
+        language = np.asarray(obs[key])
+        flat = language.reshape(-1)
+        rewritten = [self._format_outcome_prompt(str(prompt), outcome) for prompt in flat]
+        obs[key] = np.asarray(rewritten, dtype=object).reshape(language.shape)
+        return obs
+
+    def _make_cfg_pair_observations(self, obs: Dict[str, Any]) -> Dict[str, Any]:
+        """Interleave task-only and success-conditioned observations: [u0, c0, u1, c1, ...]."""
+        key = self._language_key()
+        paired: Dict[str, Any] = {}
+        for obs_key, value in obs.items():
+            if not isinstance(value, np.ndarray):
+                value = np.asarray(value)
+
+            if obs_key == key:
+                prompts = value.reshape(value.shape[0], -1)[:, 0]
+                values = []
+                for prompt in prompts:
+                    prompt = str(prompt)
+                    values.append(prompt)
+                    values.append(self._format_outcome_prompt(prompt, "success"))
+                if value.ndim == 1:
+                    paired[obs_key] = np.asarray(values, dtype=object)
+                else:
+                    paired[obs_key] = np.asarray(values, dtype=object).reshape(
+                        value.shape[0] * 2, *value.shape[1:]
+                    )
+            else:
+                paired[obs_key] = np.repeat(value, repeats=2, axis=0)
+        return paired
+
+    def _get_cfg_guided_action(self, obs_copy: Dict[str, Any]) -> torch.Tensor:
+        paired_obs = self._make_cfg_pair_observations(obs_copy)
+        normalized_input = self.apply_transforms(paired_obs)
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
+            normalized_action = self._get_cfg_guided_action_from_normalized_input(
+                normalized_input, guidance_scale=self.cfg_guidance_scale
+            )
+        return normalized_action.float()
+
+    def _get_cfg_guided_action_from_normalized_input(
+        self, normalized_input: Dict[str, Any], guidance_scale: float
+    ) -> torch.Tensor:
+        """Run flow-matching CFG by mixing task-only/success velocities at each denoising step."""
+        backbone_inputs, action_inputs = self.model.prepare_input(normalized_input)
+        backbone_output = self.model.backbone(backbone_inputs)
+        action_head = self.model.action_head
+        backbone_output = action_head.process_backbone_output(backbone_output)
+
+        vl_embs = backbone_output.backbone_features
+        pair_batch = vl_embs.shape[0]
+        if pair_batch % 2 != 0:
+            raise ValueError(f"CFG paired batch must be even, got {pair_batch}")
+        batch_size = pair_batch // 2
+        device = vl_embs.device
+        embodiment_id = action_inputs.embodiment_id
+        state_features = action_head.state_encoder(action_inputs.state, embodiment_id)
+        actions = torch.randn(
+            size=(batch_size, action_head.config.action_horizon, action_head.config.action_dim),
+            dtype=vl_embs.dtype,
+            device=device,
+        )
+        num_steps = action_head.num_inference_timesteps
+        dt = 1.0 / num_steps
+        scale = float(guidance_scale)
+
+        for t in range(num_steps):
+            t_cont = t / float(num_steps)
+            t_discretized = int(t_cont * action_head.num_timestep_buckets)
+            paired_actions = torch.repeat_interleave(actions, repeats=2, dim=0)
+            timesteps_tensor = torch.full(
+                size=(pair_batch,), fill_value=t_discretized, device=device
+            )
+            action_features = action_head.action_encoder(
+                paired_actions, timesteps_tensor, embodiment_id
+            )
+            if action_head.config.add_pos_embed:
+                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
+                pos_embs = action_head.position_embedding(pos_ids).unsqueeze(0)
+                action_features = action_features + pos_embs
+
+            future_tokens = action_head.future_tokens.weight.unsqueeze(0).expand(
+                pair_batch, -1, -1
+            )
+            sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+            model_output = action_head.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embs,
+                timestep=timesteps_tensor,
+            )
+            pred = action_head.action_decoder(model_output, embodiment_id)
+            pred_velocity = pred[:, -action_head.action_horizon :]
+            uncond_velocity = pred_velocity[0::2]
+            cond_velocity = pred_velocity[1::2]
+            guided_velocity = uncond_velocity + scale * (cond_velocity - uncond_velocity)
+            actions = actions + dt * guided_velocity
+
+        return actions
 
     def _get_unnormalized_action(self, normalized_action: torch.Tensor) -> Dict[str, Any]:
         return self.unapply_transforms({"action": normalized_action.cpu()})

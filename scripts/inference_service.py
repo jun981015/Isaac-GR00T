@@ -100,6 +100,15 @@ class ArgsConfig:
     denoising_steps: int = 4
     """The number of denoising steps to use."""
 
+    outcome_conditioning: Literal["none", "success", "guidance"] = "none"
+    """Outcome prompt conditioning for CFG-trained checkpoints."""
+
+    outcome_prompt_style: Literal["prefix", "failure_tag"] = "prefix"
+    """How to encode outcome prompts when outcome_conditioning is enabled."""
+
+    cfg_guidance_scale: float = 1.0
+    """CFG guidance scale. Used only when outcome_conditioning='guidance'."""
+
     api_token: str = None
     """API token for authentication. If not provided, authentication is disabled."""
 
@@ -190,6 +199,9 @@ def main(args: ArgsConfig):
             modality_transform=modality_transform,
             embodiment_tag=args.embodiment_tag,
             denoising_steps=args.denoising_steps,
+            outcome_conditioning=args.outcome_conditioning,
+            outcome_prompt_style=args.outcome_prompt_style,
+            cfg_guidance_scale=args.cfg_guidance_scale,
         )
 
         # Setup TensorRT if requested
